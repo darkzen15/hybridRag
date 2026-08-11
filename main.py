@@ -8,7 +8,7 @@ import os
 import re
 import time
 import uuid
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional
 
 import docx
 import pandas as pd
@@ -37,6 +37,7 @@ neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=("neo4j", "password123"))
 
 COLLECTION_NAME = "hybrid_docs"
 EMBEDDING_KEYWORDS = ["embed", "nomic-embed", "bge-m3", "minilm", "mxbai"]
+BATCH_SIZE = 64
 
 # Initialize spaCy NLP model for deterministic NER
 try:
@@ -147,6 +148,48 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> List[st
         chunks.append(text[start:end])
         start += chunk_size - overlap
     return chunks
+
+
+def embed_and_upsert_chunks(
+    chunks: Iterable[str], 
+    source: str, 
+    extra_payload: Optional[dict] = None, 
+    batch_size: int = BATCH_SIZE
+) -> int:
+    """Streams text chunks, generates embeddings via Ollama, and upserts vectors to Qdrant in mini-batches."""
+    points_batch = []
+    total_indexed = 0
+    extra_payload = extra_payload or {}
+
+    for idx, chunk_str in enumerate(chunks):
+        chunk_id = str(uuid.uuid4())
+        emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
+        
+        payload = {
+            "text": chunk_str,
+            "source": source,
+            "chunk_index": idx,
+            **extra_payload
+        }
+        
+        points_batch.append(
+            PointStruct(
+                id=chunk_id,
+                vector=emb_res["embedding"],
+                payload=payload
+            )
+        )
+        total_indexed += 1
+
+        if len(points_batch) >= batch_size:
+            qdrant.upsert(collection_name=COLLECTION_NAME, points=points_batch)
+            points_batch.clear()
+
+    if points_batch:
+        qdrant.upsert(collection_name=COLLECTION_NAME, points=points_batch)
+        points_batch.clear()
+
+    return total_indexed
 
 
 # =====================================================================
@@ -605,60 +648,58 @@ def parse_log_entries(log_text: str) -> List[dict]:
 
 
 def ingest_logs_to_neo4j(log_entries: List[dict], source_doc: str) -> int:
-    """Extracts warning/error log events, levels, and raised exception types into Neo4j."""
-    triples_created = 0
+    """Batches log event creation into a single UNWIND transaction to handle 100k+ records safely."""
     file_prefix = os.path.splitext(source_doc)[0]
+    batch = []
+
+    for idx, entry in enumerate(log_entries):
+        if entry["level"] in ["ERROR", "CRITICAL", "FATAL", "WARN", "WARNING"]:
+            error_types = re.findall(r'([A-Za-z0-9_]+Error|[A-Za-z0-9_]+Exception)', entry["details"])
+            batch.append({
+                "log_id": f"Log_{file_prefix}_{idx + 1}",
+                "timestamp": entry["timestamp"],
+                "message": entry["message"][:200],
+                "level": entry["level"],
+                "source_doc": source_doc,
+                "error_types": list(set(error_types))
+            })
+
+    if not batch:
+        return 0
+
+    cypher_batch = """
+    UNWIND $batch AS item
+    MERGE (l:Entity:LogEvent {name: item.log_id})
+    SET l.timestamp = item.timestamp, 
+        l.message = item.message, 
+        l.level = item.level, 
+        l.source_doc = item.source_doc
+    MERGE (lvl:Entity:LogLevel {name: item.level})
+    MERGE (l)-[:HAS_LEVEL]->(lvl)
+    WITH l, item
+    UNWIND item.error_types AS err_name
+    MERGE (e:Entity:ErrorType {name: err_name})
+    MERGE (l)-[:RAISED_ERROR]->(e)
+    RETURN count(l)
+    """
 
     with neo4j_driver.session() as session:
-        for idx, entry in enumerate(log_entries):
-            if entry["level"] in ["ERROR", "CRITICAL", "FATAL", "WARN", "WARNING"]:
-                log_id = f"Log_{file_prefix}_{idx + 1}"
-                cypher_log = """
-                MERGE (l:Entity:LogEvent {name: $log_id})
-                SET l.timestamp = $timestamp, l.message = $message, l.level = $level, l.source_doc = $source_doc
-                MERGE (lvl:Entity:LogLevel {name: $level})
-                MERGE (l)-[r:HAS_LEVEL]->(lvl)
-                RETURN count(r)
-                """
-                res = session.run(
-                    cypher_log,
-                    log_id=log_id,
-                    timestamp=entry["timestamp"],
-                    message=entry["message"][:200],
-                    level=entry["level"],
-                    source_doc=source_doc
-                )
-                triples_created += res.single()[0] if res.peek() else 1
-
-                error_types = re.findall(r'([A-Za-z0-9_]+Error|[A-Za-z0-9_]+Exception)', entry["details"])
-                for err_name in set(error_types):
-                    cypher_err = """
-                    MATCH (l:Entity:LogEvent {name: $log_id})
-                    MERGE (e:Entity:ErrorType {name: $err_name})
-                    MERGE (l)-[r:RAISED_ERROR]->(e)
-                    RETURN count(r)
-                    """
-                    res_err = session.run(cypher_err, log_id=log_id, err_name=err_name)
-                    triples_created += res_err.single()[0] if res_err.peek() else 1
-
-    return triples_created
+        res = session.run(cypher_batch, batch=batch)
+        return len(batch)
 
 
-def chunk_log_entries(log_entries: List[dict], max_entries_per_chunk: int = 10) -> List[str]:
-    """Chunks logs by complete multi-line entries so stack traces are never sliced in half."""
-    chunks = []
+def chunk_log_entries(log_entries: List[dict], max_entries_per_chunk: int = 10):
+    """Yields multi-line log chunk strings iteratively as a generator to minimize memory allocation."""
     current_block = []
 
     for entry in log_entries:
         current_block.append(entry["details"])
         if len(current_block) >= max_entries_per_chunk:
-            chunks.append("\n\n".join(current_block))
+            yield "\n\n".join(current_block)
             current_block = []
 
     if current_block:
-        chunks.append("\n\n".join(current_block))
-
-    return chunks
+        yield "\n\n".join(current_block)
 
 
 # =====================================================================
@@ -945,24 +986,10 @@ async def ingest_content(
 
                     total_triples += ingest_json_to_neo4j(json_payload, source_doc=filename)
                     json_chunks = chunk_json_object_level(json_payload)
+                    indexed_count = embed_and_upsert_chunks(json_chunks, source=filename, extra_payload={"is_json": True})
 
-                    points = []
-                    for idx, chunk_str in enumerate(json_chunks):
-                        chunk_id = str(uuid.uuid4())
-                        emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
-                        points.append(
-                            PointStruct(
-                                id=chunk_id,
-                                vector=emb_res["embedding"],
-                                payload={"text": chunk_str, "source": filename, "chunk_index": idx, "is_json": True}
-                            )
-                        )
-
-                    if points:
-                        qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
-                        total_chunks += len(json_chunks)
-                        processed_files.append(filename)
-
+                    total_chunks += indexed_count
+                    processed_files.append(filename)
                     continue
                 except Exception as e:
                     print(f"[JSON Ingest Error] Falling back to text mode for {filename}: {e}")
@@ -979,24 +1006,10 @@ async def ingest_content(
 
                     total_triples += ingest_tabular_to_neo4j(df, source_doc=filename)
                     tabular_chunks = chunk_tabular_dataframe(df, max_rows_per_chunk=5)
+                    indexed_count = embed_and_upsert_chunks(tabular_chunks, source=filename, extra_payload={"is_tabular": True})
 
-                    points = []
-                    for idx, chunk_str in enumerate(tabular_chunks):
-                        chunk_id = str(uuid.uuid4())
-                        emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
-                        points.append(
-                            PointStruct(
-                                id=chunk_id,
-                                vector=emb_res["embedding"],
-                                payload={"text": chunk_str, "source": filename, "chunk_index": idx, "is_tabular": True}
-                            )
-                        )
-
-                    if points:
-                        qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
-                        total_chunks += len(tabular_chunks)
-                        processed_files.append(filename)
-
+                    total_chunks += indexed_count
+                    processed_files.append(filename)
                     continue
                 except Exception as e:
                     print(f"[Tabular Ingest Error] Falling back to text mode for {filename}: {e}")
@@ -1007,25 +1020,11 @@ async def ingest_content(
                     raw_decoded = decode_bytes(file_bytes)
                     if raw_decoded and raw_decoded.strip():
                         total_triples += ingest_python_ast_to_neo4j(raw_decoded, source_doc=filename)
-
                         code_chunks = chunk_python_ast(raw_decoded)
-                        points = []
-                        for idx, chunk_str in enumerate(code_chunks):
-                            chunk_id = str(uuid.uuid4())
-                            emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
-                            points.append(
-                                PointStruct(
-                                    id=chunk_id,
-                                    vector=emb_res["embedding"],
-                                    payload={"text": chunk_str, "source": filename, "chunk_index": idx, "is_code": True}
-                                )
-                            )
+                        indexed_count = embed_and_upsert_chunks(code_chunks, source=filename, extra_payload={"is_code": True})
 
-                        if points:
-                            qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
-                            total_chunks += len(code_chunks)
-                            processed_files.append(filename)
-
+                        total_chunks += indexed_count
+                        processed_files.append(filename)
                         continue
                 except Exception as e:
                     print(f"[Python AST Ingest Error] Falling back to text mode for {filename}: {e}")
@@ -1038,25 +1037,11 @@ async def ingest_content(
 
                     if yaml_payload:
                         total_triples += ingest_json_to_neo4j(yaml_payload, source_doc=filename)
-
                         yaml_chunks = chunk_yaml_by_sections(yaml_payload)
-                        points = []
-                        for idx, chunk_str in enumerate(yaml_chunks):
-                            chunk_id = str(uuid.uuid4())
-                            emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
-                            points.append(
-                                PointStruct(
-                                    id=chunk_id,
-                                    vector=emb_res["embedding"],
-                                    payload={"text": chunk_str, "source": filename, "chunk_index": idx, "is_yaml": True}
-                                )
-                            )
+                        indexed_count = embed_and_upsert_chunks(yaml_chunks, source=filename, extra_payload={"is_yaml": True})
 
-                        if points:
-                            qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
-                            total_chunks += len(yaml_chunks)
-                            processed_files.append(filename)
-
+                        total_chunks += indexed_count
+                        processed_files.append(filename)
                         continue
                 except Exception as e:
                     print(f"[YAML Ingest Error] Falling back to text mode for {filename}: {e}")
@@ -1066,25 +1051,11 @@ async def ingest_content(
                 try:
                     email_data = parse_eml_file(file_bytes)
                     total_triples += ingest_email_to_neo4j(email_data, source_doc=filename)
-
                     email_chunks = chunk_email_content(email_data)
-                    points = []
-                    for idx, chunk_str in enumerate(email_chunks):
-                        chunk_id = str(uuid.uuid4())
-                        emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
-                        points.append(
-                            PointStruct(
-                                id=chunk_id,
-                                vector=emb_res["embedding"],
-                                payload={"text": chunk_str, "source": filename, "chunk_index": idx, "is_email": True}
-                            )
-                        )
+                    indexed_count = embed_and_upsert_chunks(email_chunks, source=filename, extra_payload={"is_email": True})
 
-                    if points:
-                        qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
-                        total_chunks += len(email_chunks)
-                        processed_files.append(filename)
-
+                    total_chunks += indexed_count
+                    processed_files.append(filename)
                     continue
                 except Exception as e:
                     print(f"[Email Ingest Error] Falling back to text mode for {filename}: {e}")
@@ -1096,25 +1067,11 @@ async def ingest_content(
                     if raw_decoded and raw_decoded.strip():
                         log_entries = parse_log_entries(raw_decoded)
                         total_triples += ingest_logs_to_neo4j(log_entries, source_doc=filename)
-
                         log_chunks = chunk_log_entries(log_entries, max_entries_per_chunk=10)
-                        points = []
-                        for idx, chunk_str in enumerate(log_chunks):
-                            chunk_id = str(uuid.uuid4())
-                            emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
-                            points.append(
-                                PointStruct(
-                                    id=chunk_id,
-                                    vector=emb_res["embedding"],
-                                    payload={"text": chunk_str, "source": filename, "chunk_index": idx, "is_log": True}
-                                )
-                            )
+                        indexed_count = embed_and_upsert_chunks(log_chunks, source=filename, extra_payload={"is_log": True})
 
-                        if points:
-                            qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
-                            total_chunks += len(log_chunks)
-                            processed_files.append(filename)
-
+                        total_chunks += indexed_count
+                        processed_files.append(filename)
                         continue
                 except Exception as e:
                     print(f"[Log Ingest Error] Falling back to text mode for {filename}: {e}")
@@ -1125,13 +1082,14 @@ async def ingest_content(
                 continue
 
             chunks = chunk_text(raw_text, chunk_size=1000, overlap=100)
-            points = []
+            points_batch = []
+            prose_chunks_count = 0
 
             for idx, chunk in enumerate(chunks):
                 chunk_id = str(uuid.uuid4())
                 emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk)
 
-                points.append(
+                points_batch.append(
                     PointStruct(
                         id=chunk_id,
                         vector=emb_res["embedding"],
@@ -1143,11 +1101,18 @@ async def ingest_content(
                     source_doc=filename,
                     chunk_id=chunk_id
                 )
+                prose_chunks_count += 1
 
-            if points:
-                qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
-                total_chunks += len(chunks)
-                processed_files.append(filename)
+                if len(points_batch) >= BATCH_SIZE:
+                    qdrant.upsert(collection_name=COLLECTION_NAME, points=points_batch)
+                    points_batch.clear()
+
+            if points_batch:
+                qdrant.upsert(collection_name=COLLECTION_NAME, points=points_batch)
+                points_batch.clear()
+
+            total_chunks += prose_chunks_count
+            processed_files.append(filename)
 
         return {
             "status": "success",
@@ -1163,43 +1128,33 @@ async def ingest_content(
         if not raw_text:
             raise HTTPException(status_code=400, detail="Text payload is empty.")
 
-        # Check if text payload is direct raw JSON
+        # Direct raw JSON string payload
         if raw_text.startswith("{") or raw_text.startswith("["):
             try:
                 json_payload = json.loads(raw_text)
                 total_triples += ingest_json_to_neo4j(json_payload, source_doc="raw_json_text")
                 json_chunks = chunk_json_object_level(json_payload)
+                indexed_count = embed_and_upsert_chunks(json_chunks, source="raw_json_text", extra_payload={"is_json": True})
 
-                points = []
-                for idx, chunk_str in enumerate(json_chunks):
-                    chunk_id = str(uuid.uuid4())
-                    emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
-                    points.append(
-                        PointStruct(
-                            id=chunk_id,
-                            vector=emb_res["embedding"],
-                            payload={"text": chunk_str, "source": "raw_json_text", "chunk_index": idx, "is_json": True}
-                        )
-                    )
-
-                qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
                 return {
                     "status": "success",
                     "filename": "raw_json_text",
-                    "chunks_processed": len(json_chunks),
-                    "vector_status": f"Indexed {len(json_chunks)} chunks in Qdrant",
+                    "chunks_processed": indexed_count,
+                    "vector_status": f"Indexed {indexed_count} chunks in Qdrant",
                     "graph_status": f"Stored {total_triples} relationship triples in Neo4j"
                 }
             except Exception:
                 pass
 
+        # Direct prose text payload
         chunks = chunk_text(raw_text, chunk_size=1000, overlap=100)
-        points = []
+        points_batch = []
+        prose_chunks_count = 0
 
         for idx, chunk in enumerate(chunks):
             chunk_id = str(uuid.uuid4())
             emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk)
-            points.append(
+            points_batch.append(
                 PointStruct(
                     id=chunk_id,
                     vector=emb_res["embedding"],
@@ -1211,14 +1166,21 @@ async def ingest_content(
                 source_doc="direct_text",
                 chunk_id=chunk_id
             )
+            prose_chunks_count += 1
 
-        qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+            if len(points_batch) >= BATCH_SIZE:
+                qdrant.upsert(collection_name=COLLECTION_NAME, points=points_batch)
+                points_batch.clear()
+
+        if points_batch:
+            qdrant.upsert(collection_name=COLLECTION_NAME, points=points_batch)
+            points_batch.clear()
 
         return {
             "status": "success",
             "filename": "raw_text",
-            "chunks_processed": len(chunks),
-            "vector_status": f"Indexed {len(chunks)} chunks in Qdrant",
+            "chunks_processed": prose_chunks_count,
+            "vector_status": f"Indexed {prose_chunks_count} chunks in Qdrant",
             "graph_status": f"Stored {total_triples} relationship triples in Neo4j"
         }
 
