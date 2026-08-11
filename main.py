@@ -4,10 +4,11 @@ import os
 import re
 import time
 import uuid
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional
 
 import docx
 import pypdf
+import spacy
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from neo4j import GraphDatabase
@@ -30,6 +31,25 @@ neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=("neo4j", "password123"))
 
 COLLECTION_NAME = "hybrid_docs"
 EMBEDDING_KEYWORDS = ["embed", "nomic-embed", "bge-m3", "minilm", "mxbai"]
+
+# Initialize spaCy NLP Model for deterministic NER
+try:
+    nlp = spacy.load("en_core_web_sm")
+except Exception:
+    import spacy.cli
+    spacy.cli.download("en_core_web_sm")
+    nlp = spacy.load("en_core_web_sm")
+
+SPACY_LABEL_MAP = {
+    "ORG": "ORGANIZATION",
+    "PERSON": "PERSON",
+    "GPE": "LOCATION",
+    "LOC": "LOCATION",
+    "PRODUCT": "TECHNOLOGY",
+    "EVENT": "EVENT",
+    "WORK_OF_ART": "CONCEPT",
+    "LAW": "CONCEPT"
+}
 
 
 # --- Schemas ---
@@ -70,7 +90,7 @@ class ModelList(BaseModel):
     data: List[ModelItem]
 
 
-# --- Multi-Encoding & Text Processing Helpers ---
+# --- Text Processing & Decoding Helpers ---
 def decode_bytes(file_bytes: bytes) -> str:
     """Try multiple text encodings to handle Windows UTF-16, UTF-8 BOM, and Latin-1."""
     for encoding in ["utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "latin-1"]:
@@ -86,8 +106,6 @@ def format_json_for_rag(json_str: str) -> str:
     """Format JSON structures into clean, chunkable text blocks."""
     try:
         parsed = json.loads(json_str)
-
-        # If JSON is an array of objects/records, format each as a distinct block
         if isinstance(parsed, list):
             blocks = []
             for item in parsed:
@@ -96,13 +114,10 @@ def format_json_for_rag(json_str: str) -> str:
                 else:
                     blocks.append(str(item))
             return "\n\n---\n\n".join(blocks)
-
-        # If JSON is a single dictionary object
         elif isinstance(parsed, dict):
             return json.dumps(parsed, indent=2)
     except Exception:
-        pass  # Fallback to raw text if NDJSON or invalid JSON syntax
-
+        pass
     return json_str
 
 
@@ -128,18 +143,15 @@ def extract_file_text(filename: str, file_bytes: bytes) -> Optional[str]:
     """Dynamically route and extract text from PDFs, DOCX, JSON, source code, and text files."""
     ext = os.path.splitext(filename)[1].lower()
 
-    # 1. Binary Document Parsers
     if ext == ".pdf":
         return extract_text_from_pdf(file_bytes)
     elif ext in [".docx", ".doc"]:
         return extract_text_from_docx(file_bytes)
 
-    # 2. Robust Multi-encoding Decoding
     raw_text = decode_bytes(file_bytes)
     if not raw_text:
         return None
 
-    # 3. JSON / JSONL Formatting
     if ext in [".json", ".jsonl"] or filename.endswith(".json"):
         return format_json_for_rag(raw_text)
 
@@ -156,55 +168,94 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> List[st
     return chunks
 
 
-# --- Graph Relationship Extraction ---
-def extract_and_store_triples(text_chunk: str) -> int:
+# --- Hybrid spaCy + LLM Graph Relationship Extraction ---
+def extract_spacy_entities(text: str) -> List[Dict[str, str]]:
+    """Extract deterministic entities using spaCy in CPU milliseconds."""
+    doc = nlp(text)
+    entities = []
+    seen = set()
+
+    for ent in doc.ents:
+        name = ent.text.strip()
+        name = re.sub(r'^(the|a|an)\s+', '', name, flags=re.IGNORECASE).strip('"\'` ')
+        label = SPACY_LABEL_MAP.get(ent.label_, "CONCEPT")
+
+        if len(name) > 1 and name.lower() not in seen:
+            seen.add(name.lower())
+            entities.append({"name": name, "label": label})
+
+    return entities
+
+
+def extract_and_store_triples(text_chunk: str, source_doc: str = "unknown", chunk_id: str = "0") -> int:
+    """Combines spaCy NER for entity detection with Ollama for relationship discovery."""
+    spacy_entities = extract_spacy_entities(text_chunk)
+    entity_names = [e["name"] for e in spacy_entities]
+
     prompt = f"""
-    Extract atomic entity relationships from the text as a JSON list of objects.
+    Task: Connect the identified known entities in the text using valid relationships.
 
-    RULES:
-    1. ALWAYS return a JSON list of objects: [{{"subject": "...", "predicate": "...", "object": "..."}}]
-    2. Split compound entities into separate atomic triples.
-    3. Predicates MUST be short uppercase strings (e.g., CONNECTS_WITH, DEPENDS_ON, USES).
+    Pre-identified Known Entities:
+    {json.dumps(entity_names)}
 
-    Text: {text_chunk}
+    Rules:
+    1. Only form relationships between actual entities present in the text.
+    2. Format output strictly as JSON:
+       {{
+         "triples": [
+           {{"subject": "EntityA", "predicate": "RELATIONSHIP_VERB", "object": "EntityB"}}
+         ]
+       }}
+    3. Predicates MUST be short uppercase strings (e.g., DEPENDS_ON, USES, CONTAINS, CREATED_BY).
 
-    Respond ONLY with raw JSON.
+    Text:
+    {text_chunk}
     """
+
     try:
         res = ollama_client.chat(
             model="llama3.2",
             messages=[{"role": "user", "content": prompt}],
             format="json",
-            options={"num_ctx": 4096}
+            options={"num_ctx": 4096, "temperature": 0.0}
         )
         parsed = json.loads(res["message"]["content"])
+        triples = parsed.get("triples", [])
 
-        if isinstance(parsed, dict):
-            triples = [parsed]
-        elif isinstance(parsed, list):
-            triples = parsed
-        else:
-            triples = []
+        type_map = {e["name"].lower(): e["label"] for e in spacy_entities}
 
-        valid_triples = [
-            t for t in triples 
-            if isinstance(t, dict) and "subject" in t and "predicate" in t and "object" in t
-        ]
+        valid_triples = []
+        for t in triples:
+            sub = str(t.get("subject", "")).strip()
+            obj = str(t.get("object", "")).strip()
+            pred = str(t.get("predicate", "")).strip().upper().replace(" ", "_")
+
+            if sub and obj and pred and sub != obj:
+                valid_triples.append({
+                    "subject": sub,
+                    "subject_type": type_map.get(sub.lower(), "CONCEPT"),
+                    "predicate": pred,
+                    "object": obj,
+                    "object_type": type_map.get(obj.lower(), "CONCEPT"),
+                    "source_doc": source_doc,
+                    "chunk_id": chunk_id
+                })
 
         if valid_triples:
             cypher = """
             UNWIND $triples AS t
-            MERGE (a:Entity {name: t.subject})
-            MERGE (b:Entity {name: t.object})
-            WITH a, b, t
-            CALL apoc.create.relationship(a, t.predicate, {}, b) YIELD rel
+            CALL apoc.merge.node([t.subject_type, 'Entity'], {name: t.subject}) YIELD node as a
+            CALL apoc.merge.node([t.object_type, 'Entity'], {name: t.object}) YIELD node as b
+            CALL apoc.create.relationship(a, t.predicate, {source_doc: t.source_doc, chunk_id: t.chunk_id}, b) YIELD rel
             RETURN count(rel)
             """
             with neo4j_driver.session() as session:
                 session.run(cypher, triples=valid_triples)
             return len(valid_triples)
+
     except Exception as e:
-        print(f"[Warning] Failed to extract triples: {e}")
+        print(f"[Hybrid Extraction Error]: {e}")
+
     return 0
 
 
@@ -214,7 +265,7 @@ def fetch_hybrid_context(user_query: str) -> str:
     try:
         truncated_query = user_query[-1500:] if len(user_query) > 1500 else user_query
         emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=truncated_query)
-        
+
         if qdrant.collection_exists(COLLECTION_NAME):
             response = qdrant.query_points(
                 collection_name=COLLECTION_NAME,
@@ -222,8 +273,8 @@ def fetch_hybrid_context(user_query: str) -> str:
                 limit=3
             )
             vector_context = [
-                point.payload.get("text", "") 
-                for point in response.points 
+                point.payload.get("text", "")
+                for point in response.points
                 if point.payload and "text" in point.payload
             ]
     except Exception as e:
@@ -295,7 +346,7 @@ async def generate_sse_stream(chat_id: str, created_time: int, model_name: str, 
     yield "data: [DONE]\n\n"
 
 
-# --- Dynamic Endpoints ---
+# --- API Endpoints ---
 @app.get("/v1/models", response_model=ModelList)
 async def list_models():
     """Dynamically query Ollama and filter out embedding-only models."""
@@ -306,9 +357,8 @@ async def list_models():
 
         for m_info in raw_models:
             name = m_info.get("name") if isinstance(m_info, dict) else getattr(m_info, "name", None)
-            if name:
-                if not any(kw in name.lower() for kw in EMBEDDING_KEYWORDS):
-                    model_items.append(ModelItem(id=name, object="model", owned_by="ollama"))
+            if name and not any(kw in name.lower() for kw in EMBEDDING_KEYWORDS):
+                model_items.append(ModelItem(id=name, object="model", owned_by="ollama"))
 
     except Exception as e:
         print(f"[Warning] Could not list models from Ollama: {e}")
@@ -402,7 +452,7 @@ async def ingest_content(
             for idx, chunk in enumerate(chunks):
                 chunk_id = str(uuid.uuid4())
                 emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk)
-                
+
                 points.append(
                     PointStruct(
                         id=chunk_id,
@@ -410,7 +460,11 @@ async def ingest_content(
                         payload={"text": chunk, "source": filename, "chunk_index": idx}
                     )
                 )
-                total_triples += extract_and_store_triples(chunk)
+                total_triples += extract_and_store_triples(
+                    text_chunk=chunk,
+                    source_doc=filename,
+                    chunk_id=chunk_id
+                )
 
             if points:
                 qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
@@ -444,7 +498,11 @@ async def ingest_content(
                     payload={"text": chunk, "source": "direct_text", "chunk_index": idx}
                 )
             )
-            total_triples += extract_and_store_triples(chunk)
+            total_triples += extract_and_store_triples(
+                text_chunk=chunk,
+                source_doc="direct_text",
+                chunk_id=chunk_id
+            )
 
         qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
 
