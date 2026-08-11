@@ -1,14 +1,20 @@
+import ast
+import email
+from email import policy
+from email.parser import BytesParser
 import io
 import json
 import os
 import re
 import time
 import uuid
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import docx
+import pandas as pd
 import pypdf
 import spacy
+import yaml
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from neo4j import GraphDatabase
@@ -32,7 +38,7 @@ neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=("neo4j", "password123"))
 COLLECTION_NAME = "hybrid_docs"
 EMBEDDING_KEYWORDS = ["embed", "nomic-embed", "bge-m3", "minilm", "mxbai"]
 
-# Initialize spaCy NLP Model for deterministic NER
+# Initialize spaCy NLP model for deterministic NER
 try:
     nlp = spacy.load("en_core_web_sm")
 except Exception:
@@ -52,7 +58,7 @@ SPACY_LABEL_MAP = {
 }
 
 
-# --- Schemas ---
+# --- OpenAPI Schemas ---
 class Message(BaseModel):
     role: str
     content: str
@@ -90,7 +96,7 @@ class ModelList(BaseModel):
     data: List[ModelItem]
 
 
-# --- Text Processing & Decoding Helpers ---
+# --- Multi-Encoding & Binary Extraction Helpers ---
 def decode_bytes(file_bytes: bytes) -> str:
     """Try multiple text encodings to handle Windows UTF-16, UTF-8 BOM, and Latin-1."""
     for encoding in ["utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "latin-1"]:
@@ -100,38 +106,6 @@ def decode_bytes(file_bytes: bytes) -> str:
         except (UnicodeDecodeError, ValueError):
             continue
     return file_bytes.decode("utf-8", errors="ignore").replace("\x00", "").strip()
-
-
-def format_json_for_rag(json_str: str) -> str:
-    """Flatten JSON structures into readable key-value prose blocks for better NER and embedding extraction."""
-    try:
-        parsed = json.loads(json_str)
-
-        def flatten_dict(d, parent_key=''):
-            items = []
-            if isinstance(d, dict):
-                for k, v in d.items():
-                    new_key = f"{parent_key}.{k}" if parent_key else k
-                    if isinstance(v, (dict, list)):
-                        items.extend(flatten_dict(v, new_key))
-                    else:
-                        items.append(f"Property '{new_key}' is '{v}'.")
-            elif isinstance(d, list):
-                for idx, item in enumerate(d):
-                    new_key = f"{parent_key}[{idx}]"
-                    if isinstance(item, (dict, list)):
-                        items.extend(flatten_dict(item, new_key))
-                    else:
-                        items.append(f"Item in '{parent_key}' is '{item}'.")
-            return items
-
-        if isinstance(parsed, (dict, list)):
-            flattened = flatten_dict(parsed)
-            return "\n".join(flattened)
-    except Exception:
-        pass
-
-    return json_str
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
@@ -153,7 +127,7 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
 
 
 def extract_file_text(filename: str, file_bytes: bytes) -> Optional[str]:
-    """Dynamically route and extract text from PDFs, DOCX, JSON, source code, and text files."""
+    """Dynamically extract text from PDFs, DOCX, source code, and text files."""
     ext = os.path.splitext(filename)[1].lower()
 
     if ext == ".pdf":
@@ -162,13 +136,7 @@ def extract_file_text(filename: str, file_bytes: bytes) -> Optional[str]:
         return extract_text_from_docx(file_bytes)
 
     raw_text = decode_bytes(file_bytes)
-    if not raw_text:
-        return None
-
-    if ext in [".json", ".jsonl"] or filename.endswith(".json"):
-        return format_json_for_rag(raw_text)
-
-    return raw_text
+    return raw_text if raw_text else None
 
 
 def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> List[str]:
@@ -181,7 +149,521 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> List[st
     return chunks
 
 
-# --- Hybrid spaCy + LLM Graph Relationship Extraction ---
+# =====================================================================
+# ENGINE 1: NATIVE STRUCTURED JSON INGESTION ENGINE
+# =====================================================================
+def ingest_json_to_neo4j(
+    json_data: Any,
+    parent_node_id: Optional[str] = None,
+    parent_rel: str = "CONTAINS",
+    source_doc: str = "unknown"
+) -> int:
+    """Recursively maps structured JSON trees directly into Neo4j without LLM calls."""
+    triples_created = 0
+    with neo4j_driver.session() as session:
+        if isinstance(json_data, dict):
+            node_name = (
+                json_data.get("name")
+                or json_data.get("id")
+                or json_data.get("title")
+                or json_data.get("service")
+            )
+
+            properties = {}
+            nested_structures = {}
+            for k, v in json_data.items():
+                if isinstance(v, (dict, list)):
+                    nested_structures[k] = v
+                elif v is not None:
+                    properties[k] = str(v)
+
+            if not node_name:
+                node_name = f"Object_{uuid.uuid4().hex[:8]}"
+
+            cypher_create_node = """
+            MERGE (n:Entity:JSONNode {name: $node_name})
+            SET n += $properties, n.source_doc = $source_doc
+            RETURN id(n)
+            """
+            session.run(cypher_create_node, node_name=node_name, properties=properties, source_doc=source_doc)
+
+            if parent_node_id:
+                cypher_link = """
+                MATCH (p:Entity {name: $parent_node_id})
+                MATCH (c:Entity {name: $node_name})
+                CALL apoc.create.relationship(p, $rel, {source_doc: $source_doc}, c) YIELD rel
+                RETURN count(rel)
+                """
+                res = session.run(
+                    cypher_link,
+                    parent_node_id=parent_node_id,
+                    node_name=node_name,
+                    rel=parent_rel,
+                    source_doc=source_doc
+                )
+                triples_created += res.single()[0] if res.peek() else 1
+
+            for key, nested_val in nested_structures.items():
+                rel_type = key.upper().replace("-", "_").replace(" ", "_")
+                triples_created += ingest_json_to_neo4j(
+                    nested_val,
+                    parent_node_id=node_name,
+                    parent_rel=rel_type,
+                    source_doc=source_doc
+                )
+
+        elif isinstance(json_data, list):
+            for item in json_data:
+                triples_created += ingest_json_to_neo4j(
+                    item,
+                    parent_node_id=parent_node_id,
+                    parent_rel="HAS_ITEM",
+                    source_doc=source_doc
+                )
+
+    return triples_created
+
+
+def chunk_json_object_level(json_data: Any) -> List[str]:
+    """Chunks JSON by object boundaries so vectors never break syntax brackets."""
+    chunks = []
+    if isinstance(json_data, list):
+        for item in json_data:
+            chunks.append(json.dumps(item, indent=2))
+    elif isinstance(json_data, dict):
+        if len(json.dumps(json_data)) > 1500:
+            for k, v in json_data.items():
+                chunks.append(json.dumps({k: v}, indent=2))
+        else:
+            chunks.append(json.dumps(json_data, indent=2))
+    else:
+        chunks.append(str(json_data))
+    return chunks
+
+
+# =====================================================================
+# ENGINE 2: NATIVE TABULAR (CSV/TSV/XLSX) INGESTION ENGINE
+# =====================================================================
+def ingest_tabular_to_neo4j(df: pd.DataFrame, source_doc: str) -> int:
+    """Maps DataFrame rows directly to Neo4j nodes and creates categorical connections."""
+    df = df.fillna("")
+    table_name = os.path.splitext(source_doc)[0]
+    records = df.to_dict(orient="records")
+    triples_created = 0
+
+    with neo4j_driver.session() as session:
+        for idx, row in enumerate(records):
+            row_id = (
+                row.get("id")
+                or row.get("ID")
+                or row.get("name")
+                or row.get("Name")
+                or f"{table_name}_Row_{idx + 1}"
+            )
+            properties = {str(k).strip(): str(v).strip() for k, v in row.items() if v != ""}
+
+            cypher_row = """
+            MERGE (r:Entity:TabularRow {name: $row_id})
+            SET r += $properties, r.source_doc = $source_doc, r.table = $table_name
+            RETURN id(r)
+            """
+            session.run(cypher_row, row_id=str(row_id), properties=properties, source_doc=source_doc, table_name=table_name)
+            triples_created += 1
+
+            for col, val in row.items():
+                col_clean = str(col).strip()
+                val_clean = str(val).strip()
+                if val_clean and col_clean.lower() in [
+                    "category", "department", "type", "status", "group", "role", "location"
+                ]:
+                    rel_type = f"HAS_{col_clean.upper().replace(' ', '_')}"
+                    cypher_link = """
+                    MATCH (r:Entity:TabularRow {name: $row_id})
+                    MERGE (v:Entity:Category {name: $val_clean})
+                    CALL apoc.create.relationship(r, $rel_type, {source_doc: $source_doc}, v) YIELD rel
+                    RETURN count(rel)
+                    """
+                    session.run(cypher_link, row_id=str(row_id), val_clean=val_clean, rel_type=rel_type, source_doc=source_doc)
+                    triples_created += 1
+
+    return triples_created
+
+
+def chunk_tabular_dataframe(df: pd.DataFrame, max_rows_per_chunk: int = 5) -> List[str]:
+    """Formats DataFrame rows into self-contained text blocks preserving column headers."""
+    df = df.fillna("")
+    records = df.to_dict(orient="records")
+    chunks = []
+
+    current_block = []
+    for idx, row in enumerate(records):
+        formatted_fields = [f"{k}: {v}" for k, v in row.items() if str(v).strip() != ""]
+        formatted_row = f"--- Record {idx + 1} ---\n" + "\n".join(formatted_fields)
+        current_block.append(formatted_row)
+
+        if len(current_block) >= max_rows_per_chunk:
+            chunks.append("\n\n".join(current_block))
+            current_block = []
+
+    if current_block:
+        chunks.append("\n\n".join(current_block))
+
+    return chunks
+
+
+# =====================================================================
+# ENGINE 3: PYTHON AST CODE INGESTION ENGINE (.py)
+# =====================================================================
+def ingest_python_ast_to_neo4j(code_str: str, source_doc: str) -> int:
+    """Parses Python AST to map modules, classes, functions, and imports in Neo4j."""
+    triples_created = 0
+    try:
+        tree = ast.parse(code_str)
+    except SyntaxError:
+        return 0
+
+    module_name = os.path.splitext(source_doc)[0]
+
+    with neo4j_driver.session() as session:
+        cypher_mod = """
+        MERGE (m:Entity:CodeModule {name: $module_name})
+        SET m.source_doc = $source_doc
+        RETURN id(m)
+        """
+        session.run(cypher_mod, module_name=module_name, source_doc=source_doc)
+
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, ast.ClassDef):
+                class_name = node.name
+                cypher_class = """
+                MATCH (m:Entity:CodeModule {name: $module_name})
+                MERGE (c:Entity:CodeClass {name: $class_name})
+                SET c.source_doc = $source_doc
+                MERGE (m)-[r:DEFINES_CLASS]->(c)
+                RETURN count(r)
+                """
+                res = session.run(cypher_class, module_name=module_name, class_name=class_name, source_doc=source_doc)
+                triples_created += res.single()[0] if res.peek() else 1
+
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        method_name = f"{class_name}.{child.name}"
+                        cypher_method = """
+                        MATCH (c:Entity:CodeClass {name: $class_name})
+                        MERGE (f:Entity:CodeFunction {name: $method_name})
+                        SET f.source_doc = $source_doc, f.is_async = $is_async
+                        MERGE (c)-[r:HAS_METHOD]->(f)
+                        RETURN count(r)
+                        """
+                        res = session.run(
+                            cypher_method,
+                            class_name=class_name,
+                            method_name=method_name,
+                            source_doc=source_doc,
+                            is_async=isinstance(child, ast.AsyncFunctionDef)
+                        )
+                        triples_created += res.single()[0] if res.peek() else 1
+
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func_name = node.name
+                cypher_func = """
+                MATCH (m:Entity:CodeModule {name: $module_name})
+                MERGE (f:Entity:CodeFunction {name: $func_name})
+                SET f.source_doc = $source_doc, f.is_async = $is_async
+                MERGE (m)-[r:DEFINES_FUNCTION]->(f)
+                RETURN count(r)
+                """
+                res = session.run(
+                    cypher_func,
+                    module_name=module_name,
+                    func_name=func_name,
+                    source_doc=source_doc,
+                    is_async=isinstance(node, ast.AsyncFunctionDef)
+                )
+                triples_created += res.single()[0] if res.peek() else 1
+
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    cypher_imp = """
+                    MATCH (m:Entity:CodeModule {name: $module_name})
+                    MERGE (i:Entity:Library {name: $lib_name})
+                    MERGE (m)-[r:IMPORTS]->(i)
+                    RETURN count(r)
+                    """
+                    res = session.run(cypher_imp, module_name=module_name, lib_name=alias.name)
+                    triples_created += res.single()[0] if res.peek() else 1
+
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    cypher_imp = """
+                    MATCH (m:Entity:CodeModule {name: $module_name})
+                    MERGE (i:Entity:Library {name: $lib_name})
+                    MERGE (m)-[r:IMPORTS_FROM]->(i)
+                    RETURN count(r)
+                    """
+                    res = session.run(cypher_imp, module_name=module_name, lib_name=node.module)
+                    triples_created += res.single()[0] if res.peek() else 1
+
+    return triples_created
+
+
+def chunk_python_ast(code_str: str) -> List[str]:
+    """Extracts classes, functions, and top-level code as atomic code chunks for Qdrant."""
+    chunks = []
+    try:
+        tree = ast.parse(code_str)
+        lines = code_str.splitlines()
+
+        header_lines = []
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                start = node.lineno - 1
+                end = getattr(node, 'end_lineno', start + 1)
+                header_lines.extend(lines[start:end])
+
+        header_prefix = "\n".join(header_lines) + "\n\n" if header_lines else ""
+
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                start = node.lineno - 1
+                end = getattr(node, 'end_lineno', len(lines))
+                body_code = "\n".join(lines[start:end])
+                chunks.append(f"# Context Header\n{header_prefix}{body_code}")
+
+    except Exception:
+        pass
+
+    if not chunks:
+        chunks = chunk_text(code_str, chunk_size=1000, overlap=100)
+
+    return chunks
+
+
+# =====================================================================
+# ENGINE 4: YAML SPEC INGESTION ENGINE (.yaml, .yml)
+# =====================================================================
+def chunk_yaml_by_sections(yaml_data: Any) -> List[str]:
+    """Chunks YAML specs by top-level section keys to preserve context and block hierarchy."""
+    chunks = []
+    if isinstance(yaml_data, dict):
+        for key, val in yaml_data.items():
+            section_yaml = yaml.dump({key: val}, default_flow_style=False)
+            chunks.append(f"--- Section: {key} ---\n{section_yaml}")
+    elif isinstance(yaml_data, list):
+        for idx, item in enumerate(yaml_data):
+            section_yaml = yaml.dump(item, default_flow_style=False)
+            chunks.append(f"--- Item {idx + 1} ---\n{section_yaml}")
+    else:
+        chunks.append(str(yaml_data))
+    return chunks
+
+
+# =====================================================================
+# ENGINE 5: EMAIL INGESTION ENGINE (.eml)
+# =====================================================================
+def parse_eml_file(file_bytes: bytes) -> dict:
+    """Parses .eml file byte contents into structured message metadata and plain text body."""
+    msg = BytesParser(policy=policy.default).parsebytes(file_bytes)
+    body = ""
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    body += payload.decode(charset, errors="ignore")
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            body = payload.decode(charset, errors="ignore")
+
+    return {
+        "subject": str(msg.get("Subject", "No Subject")),
+        "from": str(msg.get("From", "Unknown")),
+        "to": str(msg.get("To", "Unknown")),
+        "date": str(msg.get("Date", "Unknown")),
+        "message_id": str(msg.get("Message-ID", f"EML_{uuid.uuid4().hex[:8]}")),
+        "in_reply_to": str(msg.get("In-Reply-To", "")) if msg.get("In-Reply-To") else None,
+        "body": body.strip()
+    }
+
+
+def ingest_email_to_neo4j(email_data: dict, source_doc: str) -> int:
+    """Maps email message topology (sender, recipients, thread replies) directly into Neo4j."""
+    triples_created = 0
+    msg_id = email_data["message_id"]
+
+    with neo4j_driver.session() as session:
+        cypher_email = """
+        MERGE (e:Entity:Email {name: $msg_id})
+        SET e.subject = $subject, e.date = $date, e.source_doc = $source_doc
+        RETURN id(e)
+        """
+        session.run(
+            cypher_email,
+            msg_id=msg_id,
+            subject=email_data["subject"],
+            date=email_data["date"],
+            source_doc=source_doc
+        )
+        triples_created += 1
+
+        if email_data["from"] != "Unknown":
+            cypher_from = """
+            MATCH (e:Entity:Email {name: $msg_id})
+            MERGE (p:Entity:Person {name: $from_person})
+            MERGE (p)-[r:SENT]->(e)
+            RETURN count(r)
+            """
+            res = session.run(cypher_from, msg_id=msg_id, from_person=email_data["from"])
+            triples_created += res.single()[0] if res.peek() else 1
+
+        if email_data["to"] != "Unknown":
+            cypher_to = """
+            MATCH (e:Entity:Email {name: $msg_id})
+            MERGE (p:Entity:Person {name: $to_person})
+            MERGE (e)-[r:SENT_TO]->(p)
+            RETURN count(r)
+            """
+            res = session.run(cypher_to, msg_id=msg_id, to_person=email_data["to"])
+            triples_created += res.single()[0] if res.peek() else 1
+
+        if email_data["in_reply_to"]:
+            cypher_reply = """
+            MATCH (e:Entity:Email {name: $msg_id})
+            MERGE (parent:Entity:Email {name: $parent_id})
+            MERGE (e)-[r:REPLIED_TO]->(parent)
+            RETURN count(r)
+            """
+            res = session.run(cypher_reply, msg_id=msg_id, parent_id=email_data["in_reply_to"])
+            triples_created += res.single()[0] if res.peek() else 1
+
+    return triples_created
+
+
+def chunk_email_content(email_data: dict) -> List[str]:
+    """Combines email header context with body chunks to prevent context loss during vector search."""
+    header_summary = (
+        f"From: {email_data['from']}\n"
+        f"To: {email_data['to']}\n"
+        f"Date: {email_data['date']}\n"
+        f"Subject: {email_data['subject']}\n"
+    )
+
+    if not email_data["body"]:
+        return [header_summary]
+
+    body_chunks = chunk_text(email_data["body"], chunk_size=800, overlap=100)
+    return [f"{header_summary}\nMessage Content:\n{c}" for c in body_chunks]
+
+
+# =====================================================================
+# ENGINE 6: LOG FILE INGESTION ENGINE (.log)
+# =====================================================================
+LOG_TIMESTAMP_PATTERN = re.compile(
+    r'^(?P<timestamp>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+'
+    r'\[?(?P<level>DEBUG|INFO|WARN|WARNING|ERROR|CRITICAL|FATAL)\]?\s+'
+    r'(?P<message>.*)',
+    re.IGNORECASE
+)
+
+
+def parse_log_entries(log_text: str) -> List[dict]:
+    """Groups multi-line log events and stack traces into structured log entry dicts."""
+    lines = log_text.splitlines()
+    entries = []
+    current_entry = None
+
+    for line in lines:
+        match = LOG_TIMESTAMP_PATTERN.match(line)
+        if match:
+            if current_entry:
+                entries.append(current_entry)
+            current_entry = {
+                "timestamp": match.group("timestamp"),
+                "level": match.group("level").upper(),
+                "message": match.group("message"),
+                "details": line
+            }
+        else:
+            if current_entry:
+                current_entry["details"] += "\n" + line
+            else:
+                current_entry = {
+                    "timestamp": "UNKNOWN",
+                    "level": "INFO",
+                    "message": line,
+                    "details": line
+                }
+
+    if current_entry:
+        entries.append(current_entry)
+
+    return entries
+
+
+def ingest_logs_to_neo4j(log_entries: List[dict], source_doc: str) -> int:
+    """Extracts warning/error log events, levels, and raised exception types into Neo4j."""
+    triples_created = 0
+    file_prefix = os.path.splitext(source_doc)[0]
+
+    with neo4j_driver.session() as session:
+        for idx, entry in enumerate(log_entries):
+            if entry["level"] in ["ERROR", "CRITICAL", "FATAL", "WARN", "WARNING"]:
+                log_id = f"Log_{file_prefix}_{idx + 1}"
+                cypher_log = """
+                MERGE (l:Entity:LogEvent {name: $log_id})
+                SET l.timestamp = $timestamp, l.message = $message, l.level = $level, l.source_doc = $source_doc
+                MERGE (lvl:Entity:LogLevel {name: $level})
+                MERGE (l)-[r:HAS_LEVEL]->(lvl)
+                RETURN count(r)
+                """
+                res = session.run(
+                    cypher_log,
+                    log_id=log_id,
+                    timestamp=entry["timestamp"],
+                    message=entry["message"][:200],
+                    level=entry["level"],
+                    source_doc=source_doc
+                )
+                triples_created += res.single()[0] if res.peek() else 1
+
+                error_types = re.findall(r'([A-Za-z0-9_]+Error|[A-Za-z0-9_]+Exception)', entry["details"])
+                for err_name in set(error_types):
+                    cypher_err = """
+                    MATCH (l:Entity:LogEvent {name: $log_id})
+                    MERGE (e:Entity:ErrorType {name: $err_name})
+                    MERGE (l)-[r:RAISED_ERROR]->(e)
+                    RETURN count(r)
+                    """
+                    res_err = session.run(cypher_err, log_id=log_id, err_name=err_name)
+                    triples_created += res_err.single()[0] if res_err.peek() else 1
+
+    return triples_created
+
+
+def chunk_log_entries(log_entries: List[dict], max_entries_per_chunk: int = 10) -> List[str]:
+    """Chunks logs by complete multi-line entries so stack traces are never sliced in half."""
+    chunks = []
+    current_block = []
+
+    for entry in log_entries:
+        current_block.append(entry["details"])
+        if len(current_block) >= max_entries_per_chunk:
+            chunks.append("\n\n".join(current_block))
+            current_block = []
+
+    if current_block:
+        chunks.append("\n\n".join(current_block))
+
+    return chunks
+
+
+# =====================================================================
+# ENGINE 7: UNSTRUCTURED PROSE INGESTION ENGINE (spaCy NER + Ollama)
+# =====================================================================
 def extract_spacy_entities(text: str) -> List[Dict[str, str]]:
     """Extract deterministic entities using spaCy in CPU milliseconds."""
     doc = nlp(text)
@@ -201,49 +683,29 @@ def extract_spacy_entities(text: str) -> List[Dict[str, str]]:
 
 
 def extract_and_store_triples(text_chunk: str, source_doc: str = "unknown", chunk_id: str = "0") -> int:
-    """Hybrid graph extraction with dynamic fallback for JSON, code, and structured data."""
+    """Extracts entity relationships for unstructured text using spaCy NER + Ollama."""
     spacy_entities = extract_spacy_entities(text_chunk)
     entity_names = [e["name"] for e in spacy_entities]
 
-    # Mode 1: Guided extraction for prose text where spaCy found entities
-    if entity_names:
-        prompt = f"""
-        Task: Connect the identified known entities in the text using valid relationships.
+    prompt = f"""
+    Task: Connect the identified known entities in the text using valid relationships.
 
-        Pre-identified Known Entities:
-        {json.dumps(entity_names)}
+    Pre-identified Known Entities:
+    {json.dumps(entity_names)}
 
-        Rules:
-        1. Only form relationships between actual entities present in the text.
-        2. Format output strictly as JSON:
-           {{
-             "triples": [
-               {{"subject": "EntityA", "predicate": "RELATIONSHIP_VERB", "object": "EntityB", "subject_type": "CONCEPT", "object_type": "CONCEPT"}}
-             ]
-           }}
-        3. Predicates MUST be short uppercase strings (e.g., DEPENDS_ON, USES, CONTAINS, CREATED_BY, HAS_PROPERTY).
+    Rules:
+    1. Only form relationships between actual entities present in the text.
+    2. Format output strictly as JSON:
+       {{
+         "triples": [
+           {{"subject": "EntityA", "predicate": "RELATIONSHIP_VERB", "object": "EntityB"}}
+         ]
+       }}
+    3. Predicates MUST be short uppercase strings (e.g., DEPENDS_ON, USES, CONTAINS, CREATED_BY).
 
-        Text:
-        {text_chunk}
-        """
-    # Mode 2: Direct extraction fallback for structured data (JSON, YAML, CSV) where spaCy NER found 0 entities
-    else:
-        prompt = f"""
-        Task: Extract entity-relationship-entity triples directly from this structured text or JSON payload.
-
-        Rules:
-        1. Extract relationships between keys, entities, objects, and values (e.g. subject: "Database", predicate: "HAS_PROPERTY", object: "Neo4j").
-        2. Format output strictly as JSON:
-           {{
-             "triples": [
-               {{"subject": "SubjectEntity", "predicate": "RELATIONSHIP_VERB", "object": "ObjectEntity", "subject_type": "CONCEPT", "object_type": "CONCEPT"}}
-             ]
-           }}
-        3. Predicates MUST be short uppercase strings (e.g., HAS_FIELD, CONTAINS, IS_A, HAS_VALUE, DEPENDS_ON).
-
-        Structured Text:
-        {text_chunk}
-        """
+    Text:
+    {text_chunk}
+    """
 
     try:
         res = ollama_client.chat(
@@ -262,16 +724,14 @@ def extract_and_store_triples(text_chunk: str, source_doc: str = "unknown", chun
             sub = str(t.get("subject", "")).strip()
             obj = str(t.get("object", "")).strip()
             pred = str(t.get("predicate", "")).strip().upper().replace(" ", "_")
-            sub_type = str(t.get("subject_type", type_map.get(sub.lower(), "CONCEPT"))).upper()
-            obj_type = str(t.get("object_type", type_map.get(obj.lower(), "CONCEPT"))).upper()
 
             if sub and obj and pred and sub != obj:
                 valid_triples.append({
                     "subject": sub,
-                    "subject_type": sub_type,
+                    "subject_type": type_map.get(sub.lower(), "CONCEPT"),
                     "predicate": pred,
                     "object": obj,
-                    "object_type": obj_type,
+                    "object_type": type_map.get(obj.lower(), "CONCEPT"),
                     "source_doc": source_doc,
                     "chunk_id": chunk_id
                 })
@@ -289,12 +749,12 @@ def extract_and_store_triples(text_chunk: str, source_doc: str = "unknown", chun
             return len(valid_triples)
 
     except Exception as e:
-        print(f"[Graph Ingestion Error]: {e}")
+        print(f"[Hybrid Extraction Error]: {e}")
 
     return 0
 
 
-# --- Hybrid Retrieval ---
+# --- Hybrid Context Retrieval ---
 def fetch_hybrid_context(user_query: str) -> str:
     vector_context = []
     try:
@@ -475,9 +935,192 @@ async def ingest_content(
         for uploaded_file in upload_queue:
             filename = uploaded_file.filename or "uploaded_doc"
             file_bytes = await uploaded_file.read()
+            ext = os.path.splitext(filename)[1].lower()
 
+            # --- 1. DEDICATED STRUCTURED JSON ROUTE ---
+            if ext in [".json", ".jsonl"]:
+                try:
+                    raw_decoded = decode_bytes(file_bytes)
+                    json_payload = json.loads(raw_decoded)
+
+                    total_triples += ingest_json_to_neo4j(json_payload, source_doc=filename)
+                    json_chunks = chunk_json_object_level(json_payload)
+
+                    points = []
+                    for idx, chunk_str in enumerate(json_chunks):
+                        chunk_id = str(uuid.uuid4())
+                        emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
+                        points.append(
+                            PointStruct(
+                                id=chunk_id,
+                                vector=emb_res["embedding"],
+                                payload={"text": chunk_str, "source": filename, "chunk_index": idx, "is_json": True}
+                            )
+                        )
+
+                    if points:
+                        qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+                        total_chunks += len(json_chunks)
+                        processed_files.append(filename)
+
+                    continue
+                except Exception as e:
+                    print(f"[JSON Ingest Error] Falling back to text mode for {filename}: {e}")
+
+            # --- 2. DEDICATED STRUCTURED TABULAR ROUTE (CSV, TSV, XLSX) ---
+            if ext in [".csv", ".tsv", ".xlsx", ".xls"]:
+                try:
+                    if ext == ".csv":
+                        df = pd.read_csv(io.BytesIO(file_bytes))
+                    elif ext == ".tsv":
+                        df = pd.read_csv(io.BytesIO(file_bytes), sep="\t")
+                    else:
+                        df = pd.read_excel(io.BytesIO(file_bytes))
+
+                    total_triples += ingest_tabular_to_neo4j(df, source_doc=filename)
+                    tabular_chunks = chunk_tabular_dataframe(df, max_rows_per_chunk=5)
+
+                    points = []
+                    for idx, chunk_str in enumerate(tabular_chunks):
+                        chunk_id = str(uuid.uuid4())
+                        emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
+                        points.append(
+                            PointStruct(
+                                id=chunk_id,
+                                vector=emb_res["embedding"],
+                                payload={"text": chunk_str, "source": filename, "chunk_index": idx, "is_tabular": True}
+                            )
+                        )
+
+                    if points:
+                        qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+                        total_chunks += len(tabular_chunks)
+                        processed_files.append(filename)
+
+                    continue
+                except Exception as e:
+                    print(f"[Tabular Ingest Error] Falling back to text mode for {filename}: {e}")
+
+            # --- 3. DEDICATED PYTHON AST CODE ROUTE (.py) ---
+            if ext == ".py":
+                try:
+                    raw_decoded = decode_bytes(file_bytes)
+                    if raw_decoded and raw_decoded.strip():
+                        total_triples += ingest_python_ast_to_neo4j(raw_decoded, source_doc=filename)
+
+                        code_chunks = chunk_python_ast(raw_decoded)
+                        points = []
+                        for idx, chunk_str in enumerate(code_chunks):
+                            chunk_id = str(uuid.uuid4())
+                            emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
+                            points.append(
+                                PointStruct(
+                                    id=chunk_id,
+                                    vector=emb_res["embedding"],
+                                    payload={"text": chunk_str, "source": filename, "chunk_index": idx, "is_code": True}
+                                )
+                            )
+
+                        if points:
+                            qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+                            total_chunks += len(code_chunks)
+                            processed_files.append(filename)
+
+                        continue
+                except Exception as e:
+                    print(f"[Python AST Ingest Error] Falling back to text mode for {filename}: {e}")
+
+            # --- 4. DEDICATED YAML SPEC ROUTE (.yaml, .yml) ---
+            if ext in [".yaml", ".yml"]:
+                try:
+                    raw_decoded = decode_bytes(file_bytes)
+                    yaml_payload = yaml.safe_load(raw_decoded)
+
+                    if yaml_payload:
+                        total_triples += ingest_json_to_neo4j(yaml_payload, source_doc=filename)
+
+                        yaml_chunks = chunk_yaml_by_sections(yaml_payload)
+                        points = []
+                        for idx, chunk_str in enumerate(yaml_chunks):
+                            chunk_id = str(uuid.uuid4())
+                            emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
+                            points.append(
+                                PointStruct(
+                                    id=chunk_id,
+                                    vector=emb_res["embedding"],
+                                    payload={"text": chunk_str, "source": filename, "chunk_index": idx, "is_yaml": True}
+                                )
+                            )
+
+                        if points:
+                            qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+                            total_chunks += len(yaml_chunks)
+                            processed_files.append(filename)
+
+                        continue
+                except Exception as e:
+                    print(f"[YAML Ingest Error] Falling back to text mode for {filename}: {e}")
+
+            # --- 5. DEDICATED EMAIL ROUTE (.eml) ---
+            if ext == ".eml":
+                try:
+                    email_data = parse_eml_file(file_bytes)
+                    total_triples += ingest_email_to_neo4j(email_data, source_doc=filename)
+
+                    email_chunks = chunk_email_content(email_data)
+                    points = []
+                    for idx, chunk_str in enumerate(email_chunks):
+                        chunk_id = str(uuid.uuid4())
+                        emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
+                        points.append(
+                            PointStruct(
+                                id=chunk_id,
+                                vector=emb_res["embedding"],
+                                payload={"text": chunk_str, "source": filename, "chunk_index": idx, "is_email": True}
+                            )
+                        )
+
+                    if points:
+                        qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+                        total_chunks += len(email_chunks)
+                        processed_files.append(filename)
+
+                    continue
+                except Exception as e:
+                    print(f"[Email Ingest Error] Falling back to text mode for {filename}: {e}")
+
+            # --- 6. DEDICATED LOG FILE ROUTE (.log) ---
+            if ext == ".log":
+                try:
+                    raw_decoded = decode_bytes(file_bytes)
+                    if raw_decoded and raw_decoded.strip():
+                        log_entries = parse_log_entries(raw_decoded)
+                        total_triples += ingest_logs_to_neo4j(log_entries, source_doc=filename)
+
+                        log_chunks = chunk_log_entries(log_entries, max_entries_per_chunk=10)
+                        points = []
+                        for idx, chunk_str in enumerate(log_chunks):
+                            chunk_id = str(uuid.uuid4())
+                            emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
+                            points.append(
+                                PointStruct(
+                                    id=chunk_id,
+                                    vector=emb_res["embedding"],
+                                    payload={"text": chunk_str, "source": filename, "chunk_index": idx, "is_log": True}
+                                )
+                            )
+
+                        if points:
+                            qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+                            total_chunks += len(log_chunks)
+                            processed_files.append(filename)
+
+                        continue
+                except Exception as e:
+                    print(f"[Log Ingest Error] Falling back to text mode for {filename}: {e}")
+
+            # --- 7. STANDARD UNSTRUCTURED TEXT / PROSE ROUTE ---
             raw_text = extract_file_text(filename, file_bytes)
-
             if not raw_text or not raw_text.strip():
                 continue
 
@@ -519,6 +1162,36 @@ async def ingest_content(
         raw_text = text.strip()
         if not raw_text:
             raise HTTPException(status_code=400, detail="Text payload is empty.")
+
+        # Check if text payload is direct raw JSON
+        if raw_text.startswith("{") or raw_text.startswith("["):
+            try:
+                json_payload = json.loads(raw_text)
+                total_triples += ingest_json_to_neo4j(json_payload, source_doc="raw_json_text")
+                json_chunks = chunk_json_object_level(json_payload)
+
+                points = []
+                for idx, chunk_str in enumerate(json_chunks):
+                    chunk_id = str(uuid.uuid4())
+                    emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
+                    points.append(
+                        PointStruct(
+                            id=chunk_id,
+                            vector=emb_res["embedding"],
+                            payload={"text": chunk_str, "source": "raw_json_text", "chunk_index": idx, "is_json": True}
+                        )
+                    )
+
+                qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+                return {
+                    "status": "success",
+                    "filename": "raw_json_text",
+                    "chunks_processed": len(json_chunks),
+                    "vector_status": f"Indexed {len(json_chunks)} chunks in Qdrant",
+                    "graph_status": f"Stored {total_triples} relationship triples in Neo4j"
+                }
+            except Exception:
+                pass
 
         chunks = chunk_text(raw_text, chunk_size=1000, overlap=100)
         points = []
