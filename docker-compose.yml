@@ -16,6 +16,14 @@ services:
       - OLLAMA_CONTEXT_LENGTH=8192
     volumes:
       - ollama_data:/root/.ollama
+    # Uncomment lines below to enable NVIDIA GPU acceleration
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
@@ -58,13 +66,21 @@ services:
     ports:
       - "3000:8080"
     environment:
+      # Route OpenAI completions directly to FastAPI middleware gateway
+      - OPENAI_API_BASE_URL=http://hybrid-rag-api:8000/v1
+      - OPENAI_API_KEY=not_needed
       - OLLAMA_BASE_URL=http://ollama-rag:11434
       - WEBUI_SECRET_KEY=secret_key_change_in_production
-      - ENABLE_RAG_HYBRID_SEARCH=True
+      # Disable Open WebUI internal RAG & web search engines
+      - ENABLE_RAG_HYBRID_SEARCH=False
+      - ENABLE_RAG_WEB_SEARCH=False
+      # Disable file attachment uploads inside Open WebUI chat
+      - RAG_FILE_MAX_COUNT=0
+      - RAG_FILE_MAX_SIZE=0
     volumes:
       - open_webui_data:/app/backend/data
     depends_on:
-      - ollama-rag
+      - hybrid-rag-api
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
@@ -91,17 +107,33 @@ services:
   # 6. Streamlit Ingestion GUI
   # ---------------------------------------------------------------------------
   ingest-gui:
-      build:
-        context: .
-        dockerfile: Dockerfile.gui
-      container_name: ingest-gui
-      ports:
-        - "8501:8501"
-      environment:
-        - API_URL=http://hybrid-rag-api:8000/ingest
-      depends_on:
-        - hybrid-rag-api
-      restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile.gui
+    container_name: ingest-gui
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://hybrid-rag-api:8000/ingest
+    depends_on:
+      - hybrid-rag-api
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 7. Promptfoo - RAG Evaluation & Benchmarking
+  # ---------------------------------------------------------------------------
+  promptfoo:
+    image: ghcr.io/promptfoo/promptfoo:latest
+    container_name: promptfoo
+    ports:
+      - "15000:15000"
+    volumes:
+      - ./:/app
+    environment:
+      - PROMPTFOO_DISABLE_TELEMETRY=true
+    depends_on:
+      - hybrid-rag-api
+    working_dir: /app
 
 volumes:
   ollama_data:

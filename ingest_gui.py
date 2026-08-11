@@ -1,4 +1,5 @@
 import datetime
+import os
 import requests
 import streamlit as st
 
@@ -8,7 +9,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialize Session State Audit History
 if "ingestion_history" not in st.session_state:
     st.session_state.ingestion_history = []
 
@@ -24,7 +24,8 @@ st.markdown('<div class="sub-title">Parse documents and load vector embeddings i
 
 # Sidebar Configuration
 st.sidebar.header("⚙️ Gateway Configuration")
-api_url = st.sidebar.text_input("Ingestion Endpoint URL", value="http://hybrid-rag-api:8000/ingest")
+default_api = os.getenv("API_URL", "http://hybrid-rag-api:8000/ingest")
+api_url = st.sidebar.text_input("Ingestion Endpoint URL", value=default_api)
 
 if st.sidebar.button("🔌 Test API Connection"):
     try:
@@ -47,7 +48,7 @@ if st.sidebar.button("🗑️ Clear Ingestion History", use_container_width=True
     st.rerun()
 
 # Layout Tabs
-tab1, tab2, tab3 = st.tabs(["📁 Bulk File Upload", "📝 Raw Text Input", "📜 Session History"])
+tab1, tab2, tab3, tab4 = st.tabs(["📁 Bulk File Upload", "🖥️ Local Directory Scan", "📝 Raw Text", "📜 Audit Log"])
 
 # --- TAB 1: BULK FILE UPLOAD ---
 with tab1:
@@ -66,12 +67,11 @@ with tab1:
         failed_count = 0
 
         for idx, file in enumerate(uploaded_files):
-            current_progress = idx / total_files
-            progress_bar.progress(current_progress, text=f"Processing ({idx + 1}/{total_files}): {file.name}")
+            progress_bar.progress(idx / total_files, text=f"Processing ({idx + 1}/{total_files}): {file.name}")
             timestamp = datetime.datetime.now().strftime("%H:%M:%S")
 
             try:
-                files = {"file": (file.name, file.getvalue(), file.type)}
+                files = [("files", (file.name, file.getvalue(), file.type))]
                 response = requests.post(api_url, files=files, timeout=300)
 
                 if response.status_code == 200:
@@ -82,9 +82,7 @@ with tab1:
                         "Source": file.name,
                         "Type": file.name.split(".")[-1].upper(),
                         "Status": "Success ✅",
-                        "Chunks": data.get("chunks_processed", 0),
-                        "Vector Status": data.get("vector_status", "Indexed"),
-                        "Graph Status": data.get("graph_status", "Stored")
+                        "Chunks": data.get("chunks_processed", 0)
                     })
                 else:
                     failed_count += 1
@@ -93,9 +91,7 @@ with tab1:
                         "Source": file.name,
                         "Type": file.name.split(".")[-1].upper(),
                         "Status": f"Failed ({response.status_code}) ❌",
-                        "Chunks": 0,
-                        "Vector Status": response.text[:50],
-                        "Graph Status": "Failed"
+                        "Chunks": 0
                     })
             except Exception as e:
                 failed_count += 1
@@ -104,16 +100,78 @@ with tab1:
                     "Source": file.name,
                     "Type": file.name.split(".")[-1].upper(),
                     "Status": "Exception ❌",
-                    "Chunks": 0,
-                    "Vector Status": str(e)[:50],
-                    "Graph Status": "Error"
+                    "Chunks": 0
                 })
 
         progress_bar.progress(1.0, text="Bulk processing complete!")
         status_container.success(f"Processed {total_files} document(s): **{successful_count} succeeded**, **{failed_count} failed**.")
 
-# --- TAB 2: RAW TEXT INPUT ---
+# --- TAB 2: LOCAL DIRECTORY SCANNER ---
 with tab2:
+    st.markdown("##### Scan and ingest a local folder path on the system host")
+    folder_path = st.text_input("Absolute Directory Path", placeholder="/path/to/my_documents or C:\\Documents")
+
+    if st.button("Scan & Ingest Folder", type="primary", disabled=not folder_path.strip()):
+        if not os.path.exists(folder_path):
+            st.error(f"Directory path not found: `{folder_path}`")
+        elif not os.path.isdir(folder_path):
+            st.error(f"Provided path is a file, not a directory: `{folder_path}`")
+        else:
+            supported_exts = (".pdf", ".docx", ".doc", ".txt", ".md")
+            found_files = []
+
+            for root, _, files in os.walk(folder_path):
+                for f in files:
+                    if f.lower().endswith(supported_exts):
+                        found_files.append(os.path.join(root, f))
+
+            if not found_files:
+                st.warning("No supported files (.pdf, .docx, .txt, .md) found in this directory.")
+            else:
+                st.info(f"Found **{len(found_files)}** document(s) in directory. Processing...")
+                prog = st.progress(0, text="Starting folder scan...")
+
+                for idx, fpath in enumerate(found_files):
+                    fname = os.path.basename(fpath)
+                    prog.progress(idx / len(found_files), text=f"Ingesting ({idx+1}/{len(found_files)}): {fname}")
+                    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+
+                    try:
+                        with open(fpath, "rb") as f_obj:
+                            files = [("files", (fname, f_obj.read()))]
+                            res = requests.post(api_url, files=files, timeout=300)
+
+                            if res.status_code == 200:
+                                data = res.json()
+                                st.session_state.ingestion_history.insert(0, {
+                                    "Timestamp": timestamp,
+                                    "Source": fname,
+                                    "Type": fname.split(".")[-1].upper(),
+                                    "Status": "Success ✅",
+                                    "Chunks": data.get("chunks_processed", 0)
+                                })
+                            else:
+                                st.session_state.ingestion_history.insert(0, {
+                                    "Timestamp": timestamp,
+                                    "Source": fname,
+                                    "Type": fname.split(".")[-1].upper(),
+                                    "Status": f"Failed ({res.status_code}) ❌",
+                                    "Chunks": 0
+                                })
+                    except Exception as e:
+                        st.session_state.ingestion_history.insert(0, {
+                            "Timestamp": timestamp,
+                            "Source": fname,
+                            "Type": fname.split(".")[-1].upper(),
+                            "Status": f"Error: {e}",
+                            "Chunks": 0
+                        })
+
+                prog.progress(1.0, text="Folder scan complete!")
+                st.success(f"Successfully processed folder: `{folder_path}`")
+
+# --- TAB 3: RAW TEXT INPUT ---
+with tab3:
     raw_text = st.text_area("Paste raw text or Markdown content", height=250, placeholder="Paste notes, transcripts, or facts...")
 
     if st.button("Ingest Text Payload", type="primary", disabled=not raw_text.strip()):
@@ -130,31 +188,17 @@ with tab2:
                         "Source": "Raw Text String",
                         "Type": "TEXT",
                         "Status": "Success ✅",
-                        "Chunks": res_data.get("chunks_processed", 0),
-                        "Vector Status": res_data.get("vector_status", "Indexed"),
-                        "Graph Status": res_data.get("graph_status", "Stored")
+                        "Chunks": res_data.get("chunks_processed", 0)
                     })
                 else:
                     st.error(f"Failed (Status {response.status_code}): {response.text}")
             except Exception as e:
                 st.error(f"Connection error: {e}")
 
-# --- TAB 3: AUDIT LOG ---
-with tab3:
+# --- TAB 4: AUDIT LOG ---
+with tab4:
     st.subheader("📜 Ingestion Audit Log")
     if st.session_state.ingestion_history:
-        st.dataframe(
-            st.session_state.ingestion_history,
-            use_container_width=True,
-            column_config={
-                "Timestamp": st.column_config.TextColumn("Time", width="small"),
-                "Source": st.column_config.TextColumn("Source Name", width="medium"),
-                "Type": st.column_config.TextColumn("Format", width="small"),
-                "Status": st.column_config.TextColumn("Status", width="small"),
-                "Chunks": st.column_config.NumberColumn("Chunks Processed"),
-                "Vector Status": st.column_config.TextColumn("Qdrant Vector Response"),
-                "Graph Status": st.column_config.TextColumn("Neo4j Graph Response"),
-            }
-        )
+        st.dataframe(st.session_state.ingestion_history, use_container_width=True)
     else:
         st.info("No documents or text payloads have been ingested during this session yet.")
