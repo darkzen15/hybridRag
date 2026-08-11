@@ -103,21 +103,34 @@ def decode_bytes(file_bytes: bytes) -> str:
 
 
 def format_json_for_rag(json_str: str) -> str:
-    """Format JSON structures into clean, chunkable text blocks."""
+    """Flatten JSON structures into readable key-value prose blocks for better NER and embedding extraction."""
     try:
         parsed = json.loads(json_str)
-        if isinstance(parsed, list):
-            blocks = []
-            for item in parsed:
-                if isinstance(item, (dict, list)):
-                    blocks.append(json.dumps(item, indent=2))
-                else:
-                    blocks.append(str(item))
-            return "\n\n---\n\n".join(blocks)
-        elif isinstance(parsed, dict):
-            return json.dumps(parsed, indent=2)
+
+        def flatten_dict(d, parent_key=''):
+            items = []
+            if isinstance(d, dict):
+                for k, v in d.items():
+                    new_key = f"{parent_key}.{k}" if parent_key else k
+                    if isinstance(v, (dict, list)):
+                        items.extend(flatten_dict(v, new_key))
+                    else:
+                        items.append(f"Property '{new_key}' is '{v}'.")
+            elif isinstance(d, list):
+                for idx, item in enumerate(d):
+                    new_key = f"{parent_key}[{idx}]"
+                    if isinstance(item, (dict, list)):
+                        items.extend(flatten_dict(item, new_key))
+                    else:
+                        items.append(f"Item in '{parent_key}' is '{item}'.")
+            return items
+
+        if isinstance(parsed, (dict, list)):
+            flattened = flatten_dict(parsed)
+            return "\n".join(flattened)
     except Exception:
         pass
+
     return json_str
 
 
@@ -188,29 +201,49 @@ def extract_spacy_entities(text: str) -> List[Dict[str, str]]:
 
 
 def extract_and_store_triples(text_chunk: str, source_doc: str = "unknown", chunk_id: str = "0") -> int:
-    """Combines spaCy NER for entity detection with Ollama for relationship discovery."""
+    """Hybrid graph extraction with dynamic fallback for JSON, code, and structured data."""
     spacy_entities = extract_spacy_entities(text_chunk)
     entity_names = [e["name"] for e in spacy_entities]
 
-    prompt = f"""
-    Task: Connect the identified known entities in the text using valid relationships.
+    # Mode 1: Guided extraction for prose text where spaCy found entities
+    if entity_names:
+        prompt = f"""
+        Task: Connect the identified known entities in the text using valid relationships.
 
-    Pre-identified Known Entities:
-    {json.dumps(entity_names)}
+        Pre-identified Known Entities:
+        {json.dumps(entity_names)}
 
-    Rules:
-    1. Only form relationships between actual entities present in the text.
-    2. Format output strictly as JSON:
-       {{
-         "triples": [
-           {{"subject": "EntityA", "predicate": "RELATIONSHIP_VERB", "object": "EntityB"}}
-         ]
-       }}
-    3. Predicates MUST be short uppercase strings (e.g., DEPENDS_ON, USES, CONTAINS, CREATED_BY).
+        Rules:
+        1. Only form relationships between actual entities present in the text.
+        2. Format output strictly as JSON:
+           {{
+             "triples": [
+               {{"subject": "EntityA", "predicate": "RELATIONSHIP_VERB", "object": "EntityB", "subject_type": "CONCEPT", "object_type": "CONCEPT"}}
+             ]
+           }}
+        3. Predicates MUST be short uppercase strings (e.g., DEPENDS_ON, USES, CONTAINS, CREATED_BY, HAS_PROPERTY).
 
-    Text:
-    {text_chunk}
-    """
+        Text:
+        {text_chunk}
+        """
+    # Mode 2: Direct extraction fallback for structured data (JSON, YAML, CSV) where spaCy NER found 0 entities
+    else:
+        prompt = f"""
+        Task: Extract entity-relationship-entity triples directly from this structured text or JSON payload.
+
+        Rules:
+        1. Extract relationships between keys, entities, objects, and values (e.g. subject: "Database", predicate: "HAS_PROPERTY", object: "Neo4j").
+        2. Format output strictly as JSON:
+           {{
+             "triples": [
+               {{"subject": "SubjectEntity", "predicate": "RELATIONSHIP_VERB", "object": "ObjectEntity", "subject_type": "CONCEPT", "object_type": "CONCEPT"}}
+             ]
+           }}
+        3. Predicates MUST be short uppercase strings (e.g., HAS_FIELD, CONTAINS, IS_A, HAS_VALUE, DEPENDS_ON).
+
+        Structured Text:
+        {text_chunk}
+        """
 
     try:
         res = ollama_client.chat(
@@ -229,14 +262,16 @@ def extract_and_store_triples(text_chunk: str, source_doc: str = "unknown", chun
             sub = str(t.get("subject", "")).strip()
             obj = str(t.get("object", "")).strip()
             pred = str(t.get("predicate", "")).strip().upper().replace(" ", "_")
+            sub_type = str(t.get("subject_type", type_map.get(sub.lower(), "CONCEPT"))).upper()
+            obj_type = str(t.get("object_type", type_map.get(obj.lower(), "CONCEPT"))).upper()
 
             if sub and obj and pred and sub != obj:
                 valid_triples.append({
                     "subject": sub,
-                    "subject_type": type_map.get(sub.lower(), "CONCEPT"),
+                    "subject_type": sub_type,
                     "predicate": pred,
                     "object": obj,
-                    "object_type": type_map.get(obj.lower(), "CONCEPT"),
+                    "object_type": obj_type,
                     "source_doc": source_doc,
                     "chunk_id": chunk_id
                 })
@@ -254,7 +289,7 @@ def extract_and_store_triples(text_chunk: str, source_doc: str = "unknown", chun
             return len(valid_triples)
 
     except Exception as e:
-        print(f"[Hybrid Extraction Error]: {e}")
+        print(f"[Graph Ingestion Error]: {e}")
 
     return 0
 
