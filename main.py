@@ -70,7 +70,42 @@ class ModelList(BaseModel):
     data: List[ModelItem]
 
 
-# --- File Extractor Helpers ---
+# --- Multi-Encoding & Text Processing Helpers ---
+def decode_bytes(file_bytes: bytes) -> str:
+    """Try multiple text encodings to handle Windows UTF-16, UTF-8 BOM, and Latin-1."""
+    for encoding in ["utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "latin-1"]:
+        try:
+            decoded = file_bytes.decode(encoding)
+            return decoded.replace("\x00", "").strip()
+        except (UnicodeDecodeError, ValueError):
+            continue
+    return file_bytes.decode("utf-8", errors="ignore").replace("\x00", "").strip()
+
+
+def format_json_for_rag(json_str: str) -> str:
+    """Format JSON structures into clean, chunkable text blocks."""
+    try:
+        parsed = json.loads(json_str)
+
+        # If JSON is an array of objects/records, format each as a distinct block
+        if isinstance(parsed, list):
+            blocks = []
+            for item in parsed:
+                if isinstance(item, (dict, list)):
+                    blocks.append(json.dumps(item, indent=2))
+                else:
+                    blocks.append(str(item))
+            return "\n\n---\n\n".join(blocks)
+
+        # If JSON is a single dictionary object
+        elif isinstance(parsed, dict):
+            return json.dumps(parsed, indent=2)
+    except Exception:
+        pass  # Fallback to raw text if NDJSON or invalid JSON syntax
+
+    return json_str
+
+
 def extract_text_from_pdf(file_bytes: bytes) -> str:
     pdf_file = io.BytesIO(file_bytes)
     reader = pypdf.PdfReader(pdf_file)
@@ -87,6 +122,28 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
     doc = docx.Document(docx_file)
     paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
     return "\n\n".join(paragraphs)
+
+
+def extract_file_text(filename: str, file_bytes: bytes) -> Optional[str]:
+    """Dynamically route and extract text from PDFs, DOCX, JSON, source code, and text files."""
+    ext = os.path.splitext(filename)[1].lower()
+
+    # 1. Binary Document Parsers
+    if ext == ".pdf":
+        return extract_text_from_pdf(file_bytes)
+    elif ext in [".docx", ".doc"]:
+        return extract_text_from_docx(file_bytes)
+
+    # 2. Robust Multi-encoding Decoding
+    raw_text = decode_bytes(file_bytes)
+    if not raw_text:
+        return None
+
+    # 3. JSON / JSONL Formatting
+    if ext in [".json", ".jsonl"] or filename.endswith(".json"):
+        return format_json_for_rag(raw_text)
+
+    return raw_text
 
 
 def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> List[str]:
@@ -250,7 +307,6 @@ async def list_models():
         for m_info in raw_models:
             name = m_info.get("name") if isinstance(m_info, dict) else getattr(m_info, "name", None)
             if name:
-                # Exclude embedding models from the chat drop-down
                 if not any(kw in name.lower() for kw in EMBEDDING_KEYWORDS):
                     model_items.append(ModelItem(id=name, object="model", owned_by="ollama"))
 
@@ -334,18 +390,10 @@ async def ingest_content(
         for uploaded_file in upload_queue:
             filename = uploaded_file.filename or "uploaded_doc"
             file_bytes = await uploaded_file.read()
-            ext = os.path.splitext(filename)[1].lower()
 
-            if ext == ".pdf":
-                raw_text = extract_text_from_pdf(file_bytes)
-            elif ext in [".docx", ".doc"]:
-                raw_text = extract_text_from_docx(file_bytes)
-            elif ext in [".txt", ".md"]:
-                raw_text = file_bytes.decode("utf-8", errors="ignore")
-            else:
-                continue
+            raw_text = extract_file_text(filename, file_bytes)
 
-            if not raw_text.strip():
+            if not raw_text or not raw_text.strip():
                 continue
 
             chunks = chunk_text(raw_text, chunk_size=1000, overlap=100)
@@ -381,7 +429,7 @@ async def ingest_content(
     elif text:
         raw_text = text.strip()
         if not raw_text:
-            raise HTTPException(status_code=400, detail="Text string is empty.")
+            raise HTTPException(status_code=400, detail="Text payload is empty.")
 
         chunks = chunk_text(raw_text, chunk_size=1000, overlap=100)
         points = []

@@ -119,21 +119,21 @@ services:
       - hybrid-rag-api
     restart: unless-stopped
 
-  # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
   # 7. Promptfoo - RAG Evaluation & Benchmarking
   # ---------------------------------------------------------------------------
   promptfoo:
     image: ghcr.io/promptfoo/promptfoo:latest
     container_name: promptfoo
     ports:
-      - "15000:15000"
+      - "15000:3000"
     volumes:
-      - ./:/app
+      - ./promptfoo_data:/home/promptfoo/.promptfoo
+      - ./:/data
     environment:
       - PROMPTFOO_DISABLE_TELEMETRY=true
     depends_on:
       - hybrid-rag-api
-    working_dir: /app
 
 volumes:
   ollama_data:
