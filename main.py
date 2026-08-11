@@ -201,8 +201,62 @@ def ingest_json_to_neo4j(
     parent_rel: str = "CONTAINS",
     source_doc: str = "unknown"
 ) -> int:
-    """Recursively maps structured JSON trees directly into Neo4j without LLM calls."""
+    """Recursively maps JSON trees with dedicated batched UNWIND processing for STIX/ATT&CK bundles."""
     triples_created = 0
+
+    # --- SPECIALIZED FAST PATH FOR STIX BUNDLES (e.g. enterprise-attack.json) ---
+    if isinstance(json_data, dict) and json_data.get("type") == "bundle" and "objects" in json_data:
+        stix_objects = json_data.get("objects", [])
+        node_batch = []
+        rel_batch = []
+
+        for obj in stix_objects:
+            if not isinstance(obj, dict):
+                continue
+            
+            stix_id = obj.get("id") or f"STIX_{uuid.uuid4().hex[:8]}"
+            raw_type = obj.get("type", "STIXObject").replace("-", "_").upper()
+            stix_name = obj.get("name") or obj.get("id") or stix_id
+
+            if raw_type == "RELATIONSHIP" and obj.get("source_ref") and obj.get("target_ref"):
+                rel_batch.append({
+                    "source": obj["source_ref"],
+                    "target": obj["target_ref"],
+                    "rel_type": obj.get("relationship_type", "RELATED_TO").upper().replace("-", "_")
+                })
+            else:
+                node_batch.append({
+                    "id": stix_id,
+                    "name": stix_name,
+                    "type": raw_type,
+                    "description": str(obj.get("description", ""))[:300]
+                })
+
+        with neo4j_driver.session() as session:
+            if node_batch:
+                cypher_nodes = """
+                UNWIND $node_batch AS item
+                CALL apoc.merge.node([item.type, 'Entity', 'STIXObject'], {name: item.id}) YIELD node as n
+                SET n.stix_name = item.name, n.description = item.description, n.source_doc = $source_doc
+                RETURN count(n)
+                """
+                res = session.run(cypher_nodes, node_batch=node_batch, source_doc=source_doc)
+                triples_created += res.single()[0] if res.peek() else len(node_batch)
+
+            if rel_batch:
+                cypher_rels = """
+                UNWIND $rel_batch AS r
+                MERGE (a:Entity {name: r.source})
+                MERGE (b:Entity {name: r.target})
+                CALL apoc.create.relationship(a, r.rel_type, {source_doc: $source_doc}, b) YIELD rel
+                RETURN count(rel)
+                """
+                res = session.run(cypher_rels, rel_batch=rel_batch, source_doc=source_doc)
+                triples_created += res.single()[0] if res.peek() else len(rel_batch)
+
+        return triples_created
+    
+# --- STANDARD RECURSIVE JSON INGESTION FOR REGULAR FILES ---
     with neo4j_driver.session() as session:
         if isinstance(json_data, dict):
             node_name = (
@@ -266,10 +320,16 @@ def ingest_json_to_neo4j(
 
     return triples_created
 
-
 def chunk_json_object_level(json_data: Any) -> List[str]:
-    """Chunks JSON by object boundaries so vectors never break syntax brackets."""
+    """Chunks JSON by object boundaries. Yields STIX elements individually for large bundles."""
     chunks = []
+    
+    # Fast path for STIX bundles
+    if isinstance(json_data, dict) and json_data.get("type") == "bundle" and "objects" in json_data:
+        for obj in json_data.get("objects", []):
+            chunks.append(json.dumps(obj, indent=2))
+        return chunks
+
     if isinstance(json_data, list):
         for item in json_data:
             chunks.append(json.dumps(item, indent=2))
@@ -281,6 +341,7 @@ def chunk_json_object_level(json_data: Any) -> List[str]:
             chunks.append(json.dumps(json_data, indent=2))
     else:
         chunks.append(str(json_data))
+        
     return chunks
 
 
