@@ -183,7 +183,7 @@ def ingest_json_to_neo4j(
             cypher_create_node = """
             MERGE (n:Entity:JSONNode {name: $node_name})
             SET n += $properties, n.source_doc = $source_doc
-            RETURN id(n)
+            RETURN elementId(n)
             """
             session.run(cypher_create_node, node_name=node_name, properties=properties, source_doc=source_doc)
 
@@ -265,7 +265,7 @@ def ingest_tabular_to_neo4j(df: pd.DataFrame, source_doc: str) -> int:
             cypher_row = """
             MERGE (r:Entity:TabularRow {name: $row_id})
             SET r += $properties, r.source_doc = $source_doc, r.table = $table_name
-            RETURN id(r)
+            RETURN elementId(r)
             """
             session.run(cypher_row, row_id=str(row_id), properties=properties, source_doc=source_doc, table_name=table_name)
             triples_created += 1
@@ -328,7 +328,7 @@ def ingest_python_ast_to_neo4j(code_str: str, source_doc: str) -> int:
         cypher_mod = """
         MERGE (m:Entity:CodeModule {name: $module_name})
         SET m.source_doc = $source_doc
-        RETURN id(m)
+        RETURN elementId(m)
         """
         session.run(cypher_mod, module_name=module_name, source_doc=source_doc)
 
@@ -499,7 +499,7 @@ def ingest_email_to_neo4j(email_data: dict, source_doc: str) -> int:
         cypher_email = """
         MERGE (e:Entity:Email {name: $msg_id})
         SET e.subject = $subject, e.date = $date, e.source_doc = $source_doc
-        RETURN id(e)
+        RETURN elementId(e)
         """
         session.run(
             cypher_email,
