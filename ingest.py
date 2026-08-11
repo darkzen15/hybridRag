@@ -3,7 +3,12 @@ import sys
 import requests
 
 API_URL = "http://localhost:8000/ingest"
-SUPPORTED_EXTENSIONS = (".pdf", ".docx", ".doc", ".txt", ".md")
+SUPPORTED_EXTENSIONS = (
+    ".pdf", ".docx", ".doc", ".txt", ".md", ".json", ".jsonl",
+    ".csv", ".tsv", ".xml", ".yaml", ".yml", ".log", ".py",
+    ".js", ".ts", ".html", ".css", ".sql", ".sh", ".env", ".ini",
+    ".conf", ".c", ".cpp", ".h", ".go", ".rs", ".java"
+)
 
 
 def ingest_file(file_path: str):
@@ -22,7 +27,7 @@ def ingest_file(file_path: str):
 
 
 def ingest_folder(folder_path: str):
-    """Recursively scan a directory and ingest all valid documents."""
+    """Recursively scan a directory and ingest all valid files."""
     print(f"\n📂 Scanning directory: {folder_path}")
     matched_files = []
 
@@ -32,10 +37,10 @@ def ingest_folder(folder_path: str):
                 matched_files.append(os.path.join(root, file))
 
     if not matched_files:
-        print("⚠️ No supported files (.pdf, .docx, .txt, .md) found in this folder.")
+        print("⚠️ No supported text/code/document files found in this folder.")
         return
 
-    print(f"Found {len(matched_files)} document(s). Starting batch ingestion...\n")
+    print(f"Found {len(matched_files)} file(s). Starting batch ingestion...\n")
     for idx, path in enumerate(matched_files, start=1):
         print(f"[{idx}/{len(matched_files)}] Ingesting...")
         ingest_file(path)

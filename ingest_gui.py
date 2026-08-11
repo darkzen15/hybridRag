@@ -20,7 +20,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-title">📥 Hybrid RAG Ingestion Studio</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">Parse documents and load vector embeddings into <b>Qdrant</b> alongside knowledge graph relationships into <b>Neo4j</b>.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Parse documents, code, JSON, logs, and text into <b>Qdrant</b> vectors and <b>Neo4j</b> graph relationships.</div>', unsafe_allow_html=True)
 
 # Sidebar Configuration
 st.sidebar.header("⚙️ Gateway Configuration")
@@ -53,8 +53,8 @@ tab1, tab2, tab3, tab4 = st.tabs(["📁 Bulk File Upload", "🖥️ Local Direct
 # --- TAB 1: BULK FILE UPLOAD ---
 with tab1:
     uploaded_files = st.file_uploader(
-        "Drag and drop documents here",
-        type=["pdf", "docx", "doc", "txt", "md"],
+        "Drag and drop documents, JSON, source code, configs, logs, or text files here",
+        type=None,  # Accepts all file formats
         accept_multiple_files=True
     )
 
@@ -80,7 +80,7 @@ with tab1:
                     st.session_state.ingestion_history.insert(0, {
                         "Timestamp": timestamp,
                         "Source": file.name,
-                        "Type": file.name.split(".")[-1].upper(),
+                        "Type": file.name.split(".")[-1].upper() if "." in file.name else "TEXT",
                         "Status": "Success ✅",
                         "Chunks": data.get("chunks_processed", 0)
                     })
@@ -89,7 +89,7 @@ with tab1:
                     st.session_state.ingestion_history.insert(0, {
                         "Timestamp": timestamp,
                         "Source": file.name,
-                        "Type": file.name.split(".")[-1].upper(),
+                        "Type": file.name.split(".")[-1].upper() if "." in file.name else "UNKNOWN",
                         "Status": f"Failed ({response.status_code}) ❌",
                         "Chunks": 0
                     })
@@ -98,13 +98,13 @@ with tab1:
                 st.session_state.ingestion_history.insert(0, {
                     "Timestamp": timestamp,
                     "Source": file.name,
-                    "Type": file.name.split(".")[-1].upper(),
+                    "Type": file.name.split(".")[-1].upper() if "." in file.name else "UNKNOWN",
                     "Status": "Exception ❌",
                     "Chunks": 0
                 })
 
         progress_bar.progress(1.0, text="Bulk processing complete!")
-        status_container.success(f"Processed {total_files} document(s): **{successful_count} succeeded**, **{failed_count} failed**.")
+        status_container.success(f"Processed {total_files} file(s): **{successful_count} succeeded**, **{failed_count} failed**.")
 
 # --- TAB 2: LOCAL DIRECTORY SCANNER ---
 with tab2:
@@ -117,7 +117,12 @@ with tab2:
         elif not os.path.isdir(folder_path):
             st.error(f"Provided path is a file, not a directory: `{folder_path}`")
         else:
-            supported_exts = (".pdf", ".docx", ".doc", ".txt", ".md")
+            supported_exts = (
+                ".pdf", ".docx", ".doc", ".txt", ".md", ".json", ".jsonl",
+                ".csv", ".tsv", ".xml", ".yaml", ".yml", ".log", ".py",
+                ".js", ".ts", ".html", ".css", ".sql", ".sh", ".env", ".ini", ".conf",
+                ".c", ".cpp", ".h", ".go", ".rs", ".java"
+            )
             found_files = []
 
             for root, _, files in os.walk(folder_path):
@@ -126,9 +131,9 @@ with tab2:
                         found_files.append(os.path.join(root, f))
 
             if not found_files:
-                st.warning("No supported files (.pdf, .docx, .txt, .md) found in this directory.")
+                st.warning("No supported files found in this directory.")
             else:
-                st.info(f"Found **{len(found_files)}** document(s) in directory. Processing...")
+                st.info(f"Found **{len(found_files)}** file(s) in directory. Processing...")
                 prog = st.progress(0, text="Starting folder scan...")
 
                 for idx, fpath in enumerate(found_files):
@@ -146,7 +151,7 @@ with tab2:
                                 st.session_state.ingestion_history.insert(0, {
                                     "Timestamp": timestamp,
                                     "Source": fname,
-                                    "Type": fname.split(".")[-1].upper(),
+                                    "Type": fname.split(".")[-1].upper() if "." in fname else "TEXT",
                                     "Status": "Success ✅",
                                     "Chunks": data.get("chunks_processed", 0)
                                 })
@@ -154,7 +159,7 @@ with tab2:
                                 st.session_state.ingestion_history.insert(0, {
                                     "Timestamp": timestamp,
                                     "Source": fname,
-                                    "Type": fname.split(".")[-1].upper(),
+                                    "Type": fname.split(".")[-1].upper() if "." in fname else "UNKNOWN",
                                     "Status": f"Failed ({res.status_code}) ❌",
                                     "Chunks": 0
                                 })
@@ -162,7 +167,7 @@ with tab2:
                         st.session_state.ingestion_history.insert(0, {
                             "Timestamp": timestamp,
                             "Source": fname,
-                            "Type": fname.split(".")[-1].upper(),
+                            "Type": fname.split(".")[-1].upper() if "." in fname else "UNKNOWN",
                             "Status": f"Error: {e}",
                             "Chunks": 0
                         })
