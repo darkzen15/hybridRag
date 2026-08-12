@@ -1,0 +1,97 @@
+version: "3.8"
+
+networks:
+  rag-network:
+    driver: bridge
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    networks:
+      - rag-network
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama_models:/root/.ollama
+    environment:
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_CONTEXT_LENGTH=4096
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  neo4j:
+    image: neo4j:5.18.0
+    container_name: neo4j-rag
+    networks:
+      - rag-network
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/password123
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_security_procedures_allowlist=apoc.*
+    volumes:
+      - neo4j_data:/data
+
+  qdrant:
+    image: qdrant/qdrant:v1.8.2
+    container_name: qdrant-rag
+    networks:
+      - rag-network
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  hybrid-rag-api:
+    image: hybrid-rag-api:arm64
+    container_name: hybrid-rag-api
+    networks:
+      - rag-network
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount local code directory into the container's application folder
+      - ./app:/app
+    environment:
+      - QDRANT_HOST=qdrant-rag
+      - NEO4J_URI=bolt://neo4j-rag:7687
+      - OLLAMA_HOST=http://ollama:11434
+    # Overrides the CMD in Dockerfile.api with auto-reload enabled
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    depends_on:
+      - neo4j
+      - qdrant
+      - ollama
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    networks:
+      - rag-network
+    ports:
+      - "3000:8080"
+    environment:
+      - OPENAI_API_BASE_URL=http://hybrid-rag-api:8000/v1
+      - OPENAI_API_KEY=sk-dummy-key
+      - ENABLE_OLLAMA_INTEGRATION=False
+      - ENABLE_RAG_HYBRID_SEARCH=False
+      - ENABLE_RAG_WEB_SEARCH=False
+    volumes:
+      - open_webui_data:/app/backend/data
+    depends_on:
+      - hybrid-rag-api
+
+volumes:
+  neo4j_data:
+  qdrant_data:
+  open_webui_data:

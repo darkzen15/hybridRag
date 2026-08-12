@@ -27,8 +27,8 @@ app = FastAPI(title="Hybrid RAG Streaming Gateway")
 
 # Environment variables
 QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant-rag")
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama-rag:11434")
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j-rag:7687")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 
 # Initialize database & Ollama clients
 ollama_client = Client(host=OLLAMA_HOST)
@@ -39,13 +39,14 @@ COLLECTION_NAME = "hybrid_docs"
 EMBEDDING_KEYWORDS = ["embed", "nomic-embed", "bge-m3", "minilm", "mxbai"]
 BATCH_SIZE = 64
 
-# Initialize spaCy NLP model for deterministic NER
+# Airgap-compliant spaCy loading (no runtime internet fallback)
 try:
     nlp = spacy.load("en_core_web_sm")
-except Exception:
-    import spacy.cli
-    spacy.cli.download("en_core_web_sm")
-    nlp = spacy.load("en_core_web_sm")
+except Exception as e:
+    raise RuntimeError(
+        "Failed to load spaCy model 'en_core_web_sm'. "
+        "Ensure 'RUN python -m spacy download en_core_web_sm' was executed in Dockerfile.api."
+    ) from e
 
 SPACY_LABEL_MAP = {
     "ORG": "ORGANIZATION",
@@ -68,7 +69,7 @@ class Message(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[Message]
-    temperature: Optional[float] = 0.7
+    temperature: Optional[float] = 0.3
     stream: Optional[bool] = False
 
 
@@ -99,7 +100,6 @@ class ModelList(BaseModel):
 
 # --- Multi-Encoding & Binary Extraction Helpers ---
 def decode_bytes(file_bytes: bytes) -> str:
-    """Try multiple text encodings to handle Windows UTF-16, UTF-8 BOM, and Latin-1."""
     for encoding in ["utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "latin-1"]:
         try:
             decoded = file_bytes.decode(encoding)
@@ -128,9 +128,7 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
 
 
 def extract_file_text(filename: str, file_bytes: bytes) -> Optional[str]:
-    """Dynamically extract text from PDFs, DOCX, source code, and text files."""
     ext = os.path.splitext(filename)[1].lower()
-
     if ext == ".pdf":
         return extract_text_from_pdf(file_bytes)
     elif ext in [".docx", ".doc"]:
@@ -156,7 +154,7 @@ def embed_and_upsert_chunks(
     extra_payload: Optional[dict] = None, 
     batch_size: int = BATCH_SIZE
 ) -> int:
-    """Streams text chunks, generates embeddings via Ollama, and upserts vectors to Qdrant in mini-batches."""
+    """Streams text chunks, auto-detects vector dimensions dynamically, and upserts to Qdrant."""
     points_batch = []
     total_indexed = 0
     extra_payload = extra_payload or {}
@@ -164,7 +162,20 @@ def embed_and_upsert_chunks(
     for idx, chunk_str in enumerate(chunks):
         chunk_id = str(uuid.uuid4())
         emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk_str)
-        
+        vector = emb_res.get("embedding")
+
+        if not vector:
+            print(f"[Embedding Error] Empty vector returned for chunk {idx}")
+            continue
+
+        # Dynamic vector dimension check
+        vector_dim = len(vector)
+        if not qdrant.collection_exists(COLLECTION_NAME):
+            qdrant.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE)
+            )
+
         payload = {
             "text": chunk_str,
             "source": source,
@@ -175,7 +186,7 @@ def embed_and_upsert_chunks(
         points_batch.append(
             PointStruct(
                 id=chunk_id,
-                vector=emb_res["embedding"],
+                vector=vector,
                 payload=payload
             )
         )
@@ -201,10 +212,9 @@ def ingest_json_to_neo4j(
     parent_rel: str = "CONTAINS",
     source_doc: str = "unknown"
 ) -> int:
-    """Recursively maps JSON trees with dedicated batched UNWIND processing for STIX/ATT&CK bundles."""
     triples_created = 0
 
-    # --- SPECIALIZED FAST PATH FOR STIX BUNDLES (e.g. enterprise-attack.json) ---
+    # Batched fast path for STIX / ATT&CK bundles
     if isinstance(json_data, dict) and json_data.get("type") == "bundle" and "objects" in json_data:
         stix_objects = json_data.get("objects", [])
         node_batch = []
@@ -255,8 +265,8 @@ def ingest_json_to_neo4j(
                 triples_created += res.single()[0] if res.peek() else len(rel_batch)
 
         return triples_created
-    
-# --- STANDARD RECURSIVE JSON INGESTION FOR REGULAR FILES ---
+
+    # Standard recursive JSON mapping
     with neo4j_driver.session() as session:
         if isinstance(json_data, dict):
             node_name = (
@@ -320,11 +330,9 @@ def ingest_json_to_neo4j(
 
     return triples_created
 
+
 def chunk_json_object_level(json_data: Any) -> List[str]:
-    """Chunks JSON by object boundaries. Yields STIX elements individually for large bundles."""
     chunks = []
-    
-    # Fast path for STIX bundles
     if isinstance(json_data, dict) and json_data.get("type") == "bundle" and "objects" in json_data:
         for obj in json_data.get("objects", []):
             chunks.append(json.dumps(obj, indent=2))
@@ -346,10 +354,9 @@ def chunk_json_object_level(json_data: Any) -> List[str]:
 
 
 # =====================================================================
-# ENGINE 2: NATIVE TABULAR (CSV/TSV/XLSX) INGESTION ENGINE
+# ENGINE 2: TABULAR INGESTION ENGINE (CSV/TSV/XLSX)
 # =====================================================================
 def ingest_tabular_to_neo4j(df: pd.DataFrame, source_doc: str) -> int:
-    """Maps DataFrame rows directly to Neo4j nodes and creates categorical connections."""
     df = df.fillna("")
     table_name = os.path.splitext(source_doc)[0]
     records = df.to_dict(orient="records")
@@ -394,7 +401,6 @@ def ingest_tabular_to_neo4j(df: pd.DataFrame, source_doc: str) -> int:
 
 
 def chunk_tabular_dataframe(df: pd.DataFrame, max_rows_per_chunk: int = 5) -> List[str]:
-    """Formats DataFrame rows into self-contained text blocks preserving column headers."""
     df = df.fillna("")
     records = df.to_dict(orient="records")
     chunks = []
@@ -419,7 +425,6 @@ def chunk_tabular_dataframe(df: pd.DataFrame, max_rows_per_chunk: int = 5) -> Li
 # ENGINE 3: PYTHON AST CODE INGESTION ENGINE (.py)
 # =====================================================================
 def ingest_python_ast_to_neo4j(code_str: str, source_doc: str) -> int:
-    """Parses Python AST to map modules, classes, functions, and imports in Neo4j."""
     triples_created = 0
     try:
         tree = ast.parse(code_str)
@@ -512,7 +517,6 @@ def ingest_python_ast_to_neo4j(code_str: str, source_doc: str) -> int:
 
 
 def chunk_python_ast(code_str: str) -> List[str]:
-    """Extracts classes, functions, and top-level code as atomic code chunks for Qdrant."""
     chunks = []
     try:
         tree = ast.parse(code_str)
@@ -547,7 +551,6 @@ def chunk_python_ast(code_str: str) -> List[str]:
 # ENGINE 4: YAML SPEC INGESTION ENGINE (.yaml, .yml)
 # =====================================================================
 def chunk_yaml_by_sections(yaml_data: Any) -> List[str]:
-    """Chunks YAML specs by top-level section keys to preserve context and block hierarchy."""
     chunks = []
     if isinstance(yaml_data, dict):
         for key, val in yaml_data.items():
@@ -566,7 +569,6 @@ def chunk_yaml_by_sections(yaml_data: Any) -> List[str]:
 # ENGINE 5: EMAIL INGESTION ENGINE (.eml)
 # =====================================================================
 def parse_eml_file(file_bytes: bytes) -> dict:
-    """Parses .eml file byte contents into structured message metadata and plain text body."""
     msg = BytesParser(policy=policy.default).parsebytes(file_bytes)
     body = ""
 
@@ -595,7 +597,6 @@ def parse_eml_file(file_bytes: bytes) -> dict:
 
 
 def ingest_email_to_neo4j(email_data: dict, source_doc: str) -> int:
-    """Maps email message topology (sender, recipients, thread replies) directly into Neo4j."""
     triples_created = 0
     msg_id = email_data["message_id"]
 
@@ -648,7 +649,6 @@ def ingest_email_to_neo4j(email_data: dict, source_doc: str) -> int:
 
 
 def chunk_email_content(email_data: dict) -> List[str]:
-    """Combines email header context with body chunks to prevent context loss during vector search."""
     header_summary = (
         f"From: {email_data['from']}\n"
         f"To: {email_data['to']}\n"
@@ -675,7 +675,6 @@ LOG_TIMESTAMP_PATTERN = re.compile(
 
 
 def parse_log_entries(log_text: str) -> List[dict]:
-    """Groups multi-line log events and stack traces into structured log entry dicts."""
     lines = log_text.splitlines()
     entries = []
     current_entry = None
@@ -709,7 +708,6 @@ def parse_log_entries(log_text: str) -> List[dict]:
 
 
 def ingest_logs_to_neo4j(log_entries: List[dict], source_doc: str) -> int:
-    """Batches log event creation into a single UNWIND transaction to handle 100k+ records safely."""
     file_prefix = os.path.splitext(source_doc)[0]
     batch = []
 
@@ -750,7 +748,6 @@ def ingest_logs_to_neo4j(log_entries: List[dict], source_doc: str) -> int:
 
 
 def chunk_log_entries(log_entries: List[dict], max_entries_per_chunk: int = 10):
-    """Yields multi-line log chunk strings iteratively as a generator to minimize memory allocation."""
     current_block = []
 
     for entry in log_entries:
@@ -767,7 +764,6 @@ def chunk_log_entries(log_entries: List[dict], max_entries_per_chunk: int = 10):
 # ENGINE 7: UNSTRUCTURED PROSE INGESTION ENGINE (spaCy NER + Ollama)
 # =====================================================================
 def extract_spacy_entities(text: str) -> List[Dict[str, str]]:
-    """Extract deterministic entities using spaCy in CPU milliseconds."""
     doc = nlp(text)
     entities = []
     seen = set()
@@ -785,7 +781,6 @@ def extract_spacy_entities(text: str) -> List[Dict[str, str]]:
 
 
 def extract_and_store_triples(text_chunk: str, source_doc: str = "unknown", chunk_id: str = "0") -> int:
-    """Extracts entity relationships for unstructured text using spaCy NER + Ollama."""
     spacy_entities = extract_spacy_entities(text_chunk)
     entity_names = [e["name"] for e in spacy_entities]
 
@@ -867,7 +862,8 @@ def fetch_hybrid_context(user_query: str) -> str:
             response = qdrant.query_points(
                 collection_name=COLLECTION_NAME,
                 query=emb_res["embedding"],
-                limit=3
+                limit=3,
+                score_threshold=0.35  # Score threshold filter
             )
             vector_context = [
                 point.payload.get("text", "")
@@ -893,13 +889,13 @@ def fetch_hybrid_context(user_query: str) -> str:
     except Exception as e:
         print(f"[Warning] Graph search error: {e}")
 
-    return f"""
-    === KNOWLEDGE GRAPH TRIPLES ===
-    {chr(10).join(graph_context) if graph_context else 'No graph facts found.'}
-
-    === UNSTRUCTURED VECTOR CHUNKS ===
-    {chr(10).join(vector_context) if vector_context else 'No vector documents found.'}
-    """
+    ctx_str = ""
+    if graph_context:
+        ctx_str += "=== INTERNAL KNOWLEDGE GRAPH TRIPLES ===\n" + "\n".join(graph_context) + "\n\n"
+    if vector_context:
+        ctx_str += "=== INTERNAL DOCUMENT CHUNKS ===\n" + "\n".join(vector_context) + "\n\n"
+        
+    return ctx_str if ctx_str else "No specific internal document context found for this query."
 
 
 # --- SSE Streaming Generator ---
@@ -913,24 +909,36 @@ async def generate_sse_stream(chat_id: str, created_time: int, model_name: str, 
     }
     yield f"data: {json.dumps(initial_chunk)}\n\n"
 
-    ollama_stream = ollama_client.chat(
-        model=model_name,
-        messages=formatted_messages,
-        stream=True,
-        options={"num_ctx": 8192}
-    )
+    try:
+        ollama_stream = ollama_client.chat(
+            model=model_name,
+            messages=formatted_messages,
+            stream=True,
+            options={"num_ctx": 4096, "temperature": 0.3}
+        )
 
-    for chunk in ollama_stream:
-        delta_text = chunk.get("message", {}).get("content", "")
-        if delta_text:
-            stream_chunk = {
-                "id": chat_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": model_name,
-                "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]
-            }
-            yield f"data: {json.dumps(stream_chunk)}\n\n"
+        for chunk in ollama_stream:
+            delta_text = chunk.get("message", {}).get("content", "")
+            if delta_text:
+                stream_chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]
+                }
+                yield f"data: {json.dumps(stream_chunk)}\n\n"
+
+    except Exception as e:
+        print(f"[Stream Exception]: {e}")
+        error_chunk = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": model_name,
+            "choices": [{"index": 0, "delta": {"content": f"\n\n[Generation error: {str(e)}]"}, "finish_reason": "error"}]
+        }
+        yield f"data: {json.dumps(error_chunk)}\n\n"
 
     final_chunk = {
         "id": chat_id,
@@ -946,7 +954,6 @@ async def generate_sse_stream(chat_id: str, created_time: int, model_name: str, 
 # --- API Endpoints ---
 @app.get("/v1/models", response_model=ModelList)
 async def list_models():
-    """Dynamically query Ollama and filter out embedding-only models."""
     model_items = []
     try:
         response = ollama_client.list()
@@ -975,8 +982,15 @@ async def chat_completions(request: ChatCompletionRequest):
     fused_context = fetch_hybrid_context(user_query)
 
     system_prompt = (
-        "You are a Hybrid RAG assistant. Answer the user prompt using ONLY "
-        "the provided Knowledge Graph Triples and Vector Chunks as context."
+        "You are an expert AI assistant. Your goal is to provide a comprehensive answer "
+        "by combining the provided internal context (Knowledge Graph and Vector Database) "
+        "with your general knowledge.\n\n"
+        "Guidelines:\n"
+        "1. Prioritize facts, numbers, and specific entities found in the INTERNAL CONTEXT.\n"
+        "2. Use your GENERAL KNOWLEDGE to explain background concepts, fill in logical gaps, "
+        "   and synthesize a clear, helpful response.\n"
+        "3. If internal context directly conflicts with general knowledge, trust the INTERNAL CONTEXT.\n"
+        "4. If no relevant internal context is present, answer using your general knowledge."
     )
     formatted_messages = [{"role": "system", "content": f"{system_prompt}\n\nContext:\n{fused_context}"}]
     for msg in request.messages:
@@ -989,13 +1003,18 @@ async def chat_completions(request: ChatCompletionRequest):
     if request.stream:
         return StreamingResponse(
             generate_sse_stream(chat_id, created_time, target_model, formatted_messages),
-            media_type="text/event-stream"
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
         )
 
     ollama_res = ollama_client.chat(
         model=target_model,
         messages=formatted_messages,
-        options={"num_ctx": 8192}
+        options={"num_ctx": 4096, "temperature": 0.3}
     )
     return ChatCompletionResponse(
         id=chat_id,
@@ -1017,21 +1036,15 @@ async def ingest_content(
     file: Optional[UploadFile] = File(None),
     text: Optional[str] = Form(None)
 ):
-    if not qdrant.collection_exists(COLLECTION_NAME):
-        qdrant.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=768, distance=Distance.COSINE)
-        )
-
     upload_queue: List[UploadFile] = []
     if files:
         upload_queue.extend(files)
     if file:
         upload_queue.append(file)
 
-    total_chunks = 0
-    total_triples = 0
-    processed_files = []
+    audit_logs = []
+    total_chunks_all = 0
+    total_triples_all = 0
 
     if upload_queue:
         for uploaded_file in upload_queue:
@@ -1039,25 +1052,20 @@ async def ingest_content(
             file_bytes = await uploaded_file.read()
             ext = os.path.splitext(filename)[1].lower()
 
-            # --- 1. DEDICATED STRUCTURED JSON ROUTE ---
-            if ext in [".json", ".jsonl"]:
-                try:
+            file_chunks = 0
+            file_triples = 0
+            status_msg = "success"
+            error_details = None
+
+            try:
+                if ext in [".json", ".jsonl"]:
                     raw_decoded = decode_bytes(file_bytes)
                     json_payload = json.loads(raw_decoded)
-
-                    total_triples += ingest_json_to_neo4j(json_payload, source_doc=filename)
+                    file_triples = ingest_json_to_neo4j(json_payload, source_doc=filename)
                     json_chunks = chunk_json_object_level(json_payload)
-                    indexed_count = embed_and_upsert_chunks(json_chunks, source=filename, extra_payload={"is_json": True})
+                    file_chunks = embed_and_upsert_chunks(json_chunks, source=filename, extra_payload={"is_json": True})
 
-                    total_chunks += indexed_count
-                    processed_files.append(filename)
-                    continue
-                except Exception as e:
-                    print(f"[JSON Ingest Error] Falling back to text mode for {filename}: {e}")
-
-            # --- 2. DEDICATED STRUCTURED TABULAR ROUTE (CSV, TSV, XLSX) ---
-            if ext in [".csv", ".tsv", ".xlsx", ".xls"]:
-                try:
+                elif ext in [".csv", ".tsv", ".xlsx", ".xls"]:
                     if ext == ".csv":
                         df = pd.read_csv(io.BytesIO(file_bytes))
                     elif ext == ".tsv":
@@ -1065,123 +1073,75 @@ async def ingest_content(
                     else:
                         df = pd.read_excel(io.BytesIO(file_bytes))
 
-                    total_triples += ingest_tabular_to_neo4j(df, source_doc=filename)
+                    file_triples = ingest_tabular_to_neo4j(df, source_doc=filename)
                     tabular_chunks = chunk_tabular_dataframe(df, max_rows_per_chunk=5)
-                    indexed_count = embed_and_upsert_chunks(tabular_chunks, source=filename, extra_payload={"is_tabular": True})
+                    file_chunks = embed_and_upsert_chunks(tabular_chunks, source=filename, extra_payload={"is_tabular": True})
 
-                    total_chunks += indexed_count
-                    processed_files.append(filename)
-                    continue
-                except Exception as e:
-                    print(f"[Tabular Ingest Error] Falling back to text mode for {filename}: {e}")
-
-            # --- 3. DEDICATED PYTHON AST CODE ROUTE (.py) ---
-            if ext == ".py":
-                try:
+                elif ext == ".py":
                     raw_decoded = decode_bytes(file_bytes)
                     if raw_decoded and raw_decoded.strip():
-                        total_triples += ingest_python_ast_to_neo4j(raw_decoded, source_doc=filename)
+                        file_triples = ingest_python_ast_to_neo4j(raw_decoded, source_doc=filename)
                         code_chunks = chunk_python_ast(raw_decoded)
-                        indexed_count = embed_and_upsert_chunks(code_chunks, source=filename, extra_payload={"is_code": True})
+                        file_chunks = embed_and_upsert_chunks(code_chunks, source=filename, extra_payload={"is_code": True})
 
-                        total_chunks += indexed_count
-                        processed_files.append(filename)
-                        continue
-                except Exception as e:
-                    print(f"[Python AST Ingest Error] Falling back to text mode for {filename}: {e}")
-
-            # --- 4. DEDICATED YAML SPEC ROUTE (.yaml, .yml) ---
-            if ext in [".yaml", ".yml"]:
-                try:
+                elif ext in [".yaml", ".yml"]:
                     raw_decoded = decode_bytes(file_bytes)
                     yaml_payload = yaml.safe_load(raw_decoded)
-
                     if yaml_payload:
-                        total_triples += ingest_json_to_neo4j(yaml_payload, source_doc=filename)
+                        file_triples = ingest_json_to_neo4j(yaml_payload, source_doc=filename)
                         yaml_chunks = chunk_yaml_by_sections(yaml_payload)
-                        indexed_count = embed_and_upsert_chunks(yaml_chunks, source=filename, extra_payload={"is_yaml": True})
+                        file_chunks = embed_and_upsert_chunks(yaml_chunks, source=filename, extra_payload={"is_yaml": True})
 
-                        total_chunks += indexed_count
-                        processed_files.append(filename)
-                        continue
-                except Exception as e:
-                    print(f"[YAML Ingest Error] Falling back to text mode for {filename}: {e}")
-
-            # --- 5. DEDICATED EMAIL ROUTE (.eml) ---
-            if ext == ".eml":
-                try:
+                elif ext == ".eml":
                     email_data = parse_eml_file(file_bytes)
-                    total_triples += ingest_email_to_neo4j(email_data, source_doc=filename)
+                    file_triples = ingest_email_to_neo4j(email_data, source_doc=filename)
                     email_chunks = chunk_email_content(email_data)
-                    indexed_count = embed_and_upsert_chunks(email_chunks, source=filename, extra_payload={"is_email": True})
+                    file_chunks = embed_and_upsert_chunks(email_chunks, source=filename, extra_payload={"is_email": True})
 
-                    total_chunks += indexed_count
-                    processed_files.append(filename)
-                    continue
-                except Exception as e:
-                    print(f"[Email Ingest Error] Falling back to text mode for {filename}: {e}")
-
-            # --- 6. DEDICATED LOG FILE ROUTE (.log) ---
-            if ext == ".log":
-                try:
+                elif ext == ".log":
                     raw_decoded = decode_bytes(file_bytes)
                     if raw_decoded and raw_decoded.strip():
                         log_entries = parse_log_entries(raw_decoded)
-                        total_triples += ingest_logs_to_neo4j(log_entries, source_doc=filename)
-                        log_chunks = chunk_log_entries(log_entries, max_entries_per_chunk=10)
-                        indexed_count = embed_and_upsert_chunks(log_chunks, source=filename, extra_payload={"is_log": True})
+                        file_triples = ingest_logs_to_neo4j(log_entries, source_doc=filename)
+                        log_chunks = list(chunk_log_entries(log_entries, max_entries_per_chunk=10))
+                        file_chunks = embed_and_upsert_chunks(log_chunks, source=filename, extra_payload={"is_log": True})
 
-                        total_chunks += indexed_count
-                        processed_files.append(filename)
-                        continue
-                except Exception as e:
-                    print(f"[Log Ingest Error] Falling back to text mode for {filename}: {e}")
+                else:
+                    raw_text = extract_file_text(filename, file_bytes)
+                    if raw_text and raw_text.strip():
+                        chunks = chunk_text(raw_text, chunk_size=1000, overlap=100)
+                        file_chunks = embed_and_upsert_chunks(chunks, source=filename)
+                        
+                        for chunk in chunks:
+                            file_triples += extract_and_store_triples(
+                                text_chunk=chunk,
+                                source_doc=filename
+                            )
 
-            # --- 7. STANDARD UNSTRUCTURED TEXT / PROSE ROUTE ---
-            raw_text = extract_file_text(filename, file_bytes)
-            if not raw_text or not raw_text.strip():
-                continue
+            except Exception as e:
+                status_msg = "partial_failure" if file_chunks > 0 or file_triples > 0 else "failed"
+                error_details = str(e)
+                print(f"[Ingest Error] {filename}: {e}")
 
-            chunks = chunk_text(raw_text, chunk_size=1000, overlap=100)
-            points_batch = []
-            prose_chunks_count = 0
+            total_chunks_all += file_chunks
+            total_triples_all += file_triples
 
-            for idx, chunk in enumerate(chunks):
-                chunk_id = str(uuid.uuid4())
-                emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk)
-
-                points_batch.append(
-                    PointStruct(
-                        id=chunk_id,
-                        vector=emb_res["embedding"],
-                        payload={"text": chunk, "source": filename, "chunk_index": idx}
-                    )
-                )
-                total_triples += extract_and_store_triples(
-                    text_chunk=chunk,
-                    source_doc=filename,
-                    chunk_id=chunk_id
-                )
-                prose_chunks_count += 1
-
-                if len(points_batch) >= BATCH_SIZE:
-                    qdrant.upsert(collection_name=COLLECTION_NAME, points=points_batch)
-                    points_batch.clear()
-
-            if points_batch:
-                qdrant.upsert(collection_name=COLLECTION_NAME, points=points_batch)
-                points_batch.clear()
-
-            total_chunks += prose_chunks_count
-            processed_files.append(filename)
+            audit_logs.append({
+                "file": filename,
+                "status": status_msg,
+                "chunks_indexed": file_chunks,
+                "triples_stored": file_triples,
+                "error": error_details
+            })
 
         return {
-            "status": "success",
-            "files_processed": processed_files,
-            "total_files": len(processed_files),
-            "chunks_processed": total_chunks,
-            "vector_status": f"Indexed {total_chunks} chunks in Qdrant",
-            "graph_status": f"Stored {total_triples} relationship triples in Neo4j"
+            "status": "completed",
+            "overall_summary": {
+                "total_files": len(upload_queue),
+                "total_chunks_indexed": total_chunks_all,
+                "total_triples_stored": total_triples_all
+            },
+            "audit_logs": audit_logs
         }
 
     elif text:
@@ -1189,61 +1149,27 @@ async def ingest_content(
         if not raw_text:
             raise HTTPException(status_code=400, detail="Text payload is empty.")
 
-        # Direct raw JSON string payload
-        if raw_text.startswith("{") or raw_text.startswith("["):
-            try:
-                json_payload = json.loads(raw_text)
-                total_triples += ingest_json_to_neo4j(json_payload, source_doc="raw_json_text")
-                json_chunks = chunk_json_object_level(json_payload)
-                indexed_count = embed_and_upsert_chunks(json_chunks, source="raw_json_text", extra_payload={"is_json": True})
+        try:
+            chunks = chunk_text(raw_text, chunk_size=1000, overlap=100)
+            indexed_count = embed_and_upsert_chunks(chunks, source="direct_text", extra_payload={"is_text": True})
 
-                return {
+            return {
+                "status": "completed",
+                "overall_summary": {
+                    "total_files": 1,
+                    "total_chunks_indexed": indexed_count,
+                    "total_triples_stored": 0
+                },
+                "audit_logs": [{
+                    "file": "direct_text",
                     "status": "success",
-                    "filename": "raw_json_text",
-                    "chunks_processed": indexed_count,
-                    "vector_status": f"Indexed {indexed_count} chunks in Qdrant",
-                    "graph_status": f"Stored {total_triples} relationship triples in Neo4j"
-                }
-            except Exception:
-                pass
-
-        # Direct prose text payload
-        chunks = chunk_text(raw_text, chunk_size=1000, overlap=100)
-        points_batch = []
-        prose_chunks_count = 0
-
-        for idx, chunk in enumerate(chunks):
-            chunk_id = str(uuid.uuid4())
-            emb_res = ollama_client.embeddings(model="nomic-embed-text", prompt=chunk)
-            points_batch.append(
-                PointStruct(
-                    id=chunk_id,
-                    vector=emb_res["embedding"],
-                    payload={"text": chunk, "source": "direct_text", "chunk_index": idx}
-                )
-            )
-            total_triples += extract_and_store_triples(
-                text_chunk=chunk,
-                source_doc="direct_text",
-                chunk_id=chunk_id
-            )
-            prose_chunks_count += 1
-
-            if len(points_batch) >= BATCH_SIZE:
-                qdrant.upsert(collection_name=COLLECTION_NAME, points=points_batch)
-                points_batch.clear()
-
-        if points_batch:
-            qdrant.upsert(collection_name=COLLECTION_NAME, points=points_batch)
-            points_batch.clear()
-
-        return {
-            "status": "success",
-            "filename": "raw_text",
-            "chunks_processed": prose_chunks_count,
-            "vector_status": f"Indexed {prose_chunks_count} chunks in Qdrant",
-            "graph_status": f"Stored {total_triples} relationship triples in Neo4j"
-        }
+                    "chunks_indexed": indexed_count,
+                    "triples_stored": 0,
+                    "error": None
+                }]
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
 
     else:
         raise HTTPException(status_code=400, detail="Must provide files or a text payload.")
